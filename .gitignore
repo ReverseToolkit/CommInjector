@@ -1,0 +1,13 @@
+# Build files
+/target
+
+# IntelliJ IDEA project files
+/.idea
+
+# AI
+/.vscode
+/.kiro
+/.cursor
+/.opencode
+/.claude
+/.trae

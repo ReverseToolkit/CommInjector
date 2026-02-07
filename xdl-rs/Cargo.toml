@@ -1,0 +1,25 @@
+[package]
+name = "xdl-rs"
+version = "0.1.0"
+edition = "2021"
+authors = ["fuqiuluo <fuqiuluo@11.com>"]
+description = "Rust bindings for xDL - Android DL functions enhancement"
+license = "MIT"
+repository = "https://github.com/yourusername/xdl-rs"
+
+[dependencies]
+libc = "0.2"
+
+[build-dependencies]
+bindgen = "0.72"
+cc = "1.0"
+
+[lib]
+name = "xdl_rs"
+crate-type = ["lib"]
+
+[target.'cfg(target_os = "android")'.dependencies]
+# Android-specific dependencies can be added here
+
+[package.metadata.android]
+# Android NDK configuration

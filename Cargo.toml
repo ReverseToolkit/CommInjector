@@ -1,0 +1,16 @@
+[package]
+name = "injector"
+version = "0.1.0"
+edition = "2024"
+authors = ["fuqiuluo"]
+
+[workspace]
+members = [
+    "xdl-rs",
+    "android-properties",
+]
+
+[dependencies]
+xdl-rs = { path = "xdl-rs" }
+android-properties = { path = "android-properties" }
+nix = { version = "0.31.1", features = ["signal", "pthread", "ptrace"] }
