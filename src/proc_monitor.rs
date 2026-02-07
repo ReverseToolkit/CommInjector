@@ -1,4 +1,5 @@
 use std::ffi::c_void;
+use std::sync::LazyLock;
 use std::thread;
 use std::time::Duration;
 
@@ -169,6 +170,14 @@ pub fn monitor_proc_start<F>(callback: F) -> Result<(), String>
 where
     F: Fn(ProcStartEvent),
 {
+    static RECONNECT_INTERVAL: LazyLock<Duration> = LazyLock::new(|| {
+        let ms = std::env::var("PROC_MONITOR_INTERVAL_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(1000);
+        Duration::from_millis(ms)
+    });
+
     let liblog = LibLog::load()?;
 
     // 清除日志 tag 过滤
@@ -177,7 +186,7 @@ where
     loop {
         let logger_list = unsafe { (liblog.logger_list_alloc)(0, 1, 0) };
         if logger_list.is_null() {
-            thread::sleep(Duration::from_secs(1));
+            thread::sleep(*RECONNECT_INTERVAL);
             continue;
         }
 
@@ -186,7 +195,7 @@ where
 
         if !has_logger {
             unsafe { (liblog.logger_list_free)(logger_list) };
-            thread::sleep(Duration::from_secs(1));
+            thread::sleep(*RECONNECT_INTERVAL);
             continue;
         }
 
@@ -215,6 +224,6 @@ where
         }
 
         unsafe { (liblog.logger_list_free)(logger_list) };
-        thread::sleep(Duration::from_secs(1));
+        thread::sleep(*RECONNECT_INTERVAL);
     }
 }
