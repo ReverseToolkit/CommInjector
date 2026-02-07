@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use log::{debug, info, warn};
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify};
 
@@ -20,38 +21,27 @@ struct Args {
     /// 等待进程就绪的超时时间（秒）
     #[arg(short, long, default_value_t = 5)]
     timeout: u64,
-
-    /// 详细输出
-    #[arg(short, long)]
-    verbose: bool,
 }
 
 fn main() -> Result<()> {
+    env_logger::init();
     let args = Args::parse();
 
-    println!("Waiting for {} to start...", args.package);
+    info!("Waiting for {} to start...", args.package);
 
     proc_monitor::monitor_proc_start(|event| {
-        if args.verbose {
-            println!(
-                "proc_start: pid={} uid={} name={}",
-                event.pid, event.uid, event.process_name
-            );
-        }
+        debug!("proc_start: pid={} uid={} name={}", event.pid, event.uid, event.process_name);
 
         if event.process_name != args.package {
             return false;
         }
 
-        println!(
-            "Target found: pid={} uid={} name={}",
-            event.pid, event.uid, event.process_name
-        );
+        info!("Target found: pid={} uid={} name={}", event.pid, event.uid, event.process_name);
 
         match wait_for_proc_ready(event.pid, Duration::from_secs(args.timeout)) {
-            Ok(true) => println!("pid {} ready, inject now!", event.pid),
-            Ok(false) => println!("pid {} exited or timeout", event.pid),
-            Err(e) => println!("wait_for_proc_ready failed: {e:#}"),
+            Ok(true) => info!("pid {} ready, inject now!", event.pid),
+            Ok(false) => warn!("pid {} exited or timeout", event.pid),
+            Err(e) => warn!("wait_for_proc_ready failed: {e:#}"),
         }
 
         true // 停止监听
