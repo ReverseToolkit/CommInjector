@@ -51,6 +51,5 @@ adb shell su -c "rm /data/adb/injector"
 adb push target/aarch64-linux-android/release/injector /data/local/tmp
 adb shell su -c "mv /data/local/tmp/injector /data/adb/injector"
 adb shell su -c "chmod 755 /data/adb/injector"
-# adb shell su -c "RUST_LOG=info /data/adb/injector -v"
 adb shell su -c "kill -9 \$(pidof injector)"
-adb shell su -c "RUST_LOG=debug /data/adb/injector -e vulkan -v"
+adb shell su -c "RUST_LOG=debug /data/adb/injector -v -p moe.fuqiuluo.mamu"
