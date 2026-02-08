@@ -1,19 +1,12 @@
 use crate::ptrace_ext::RemoteProcess;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, anyhow};
 use log::{debug, info, warn};
 use proc_maps::get_process_maps;
 use xdl_rs::safe::{XdlLibrary, XdlOpenFlags};
 
 use super::{HideTarget, Hider};
 
-/// 通过修改 linker soinfo 链表隐藏库
-///
-/// 原理（参考 AndKittyInjector）：
-/// 1. 用 xdl 打开本地 linker，通过 dsym 查找 __dl__ZL6solist / __dl__ZL6sonext 符号偏移
-/// 2. 映射到远程 linker 地址空间，读取 solist 和 sonext 指针
-/// 3. 获取 soinfo 结构体的 base 和 next 字段偏移（硬编码优先，fallback 到动态探测）
-/// 4. 遍历链表找到目标节点，修改 prev->next 实现 unlink
-/// 5. 如果目标是 sonext，更新 sonext 指向 prev
+/// 修改 linker soinfo 链表隐藏库在 linker 内部的加载痕迹
 pub struct SolistHider;
 
 impl Hider for SolistHider {
@@ -107,14 +100,14 @@ impl Hider for SolistHider {
 
 fn find_linker_symbol_offset(linker_path: &str, symbol: &str) -> Result<usize> {
     let lib = XdlLibrary::open(linker_path, XdlOpenFlags::TryForceLoad)
-        .map_err(|e| anyhow::anyhow!("xdl_open({linker_path}) failed: {e}"))?;
+        .map_err(|e| anyhow!("xdl_open({linker_path}) failed: {e}"))?;
 
-    let info = lib.info().map_err(|e| anyhow::anyhow!("xdl_info failed: {e}"))?;
+    let info = lib.info().map_err(|e| anyhow!("xdl_info failed: {e}"))?;
     let base = info.base_addr as usize;
 
     let sym = lib
         .dsym(symbol)
-        .map_err(|e| anyhow::anyhow!("xdl_dsym({symbol}) failed: {e}"))?
+        .map_err(|e| anyhow!("xdl_dsym({symbol}) failed: {e}"))?
         .context(format!("Symbol {symbol} not found in {linker_path}"))?;
 
     let addr = sym.addr as usize;
@@ -135,9 +128,15 @@ fn parse_remote_elf(proc: &RemoteProcess, base: usize) -> Result<RemoteElfInfo> 
         bail!("Not a valid ELF at {:#x}", base);
     }
 
-    let e_phoff = u64::from_ne_bytes(ehdr_buf[32..40].try_into().unwrap()) as usize;
-    let e_phentsize = u16::from_ne_bytes(ehdr_buf[54..56].try_into().unwrap()) as usize;
-    let e_phnum = u16::from_ne_bytes(ehdr_buf[56..58].try_into().unwrap()) as usize;
+    let e_phoff = u64::from_ne_bytes(
+        ehdr_buf[32..40].try_into().context("ELF ehdr e_phoff slice mismatch")?,
+    ) as usize;
+    let e_phentsize = u16::from_ne_bytes(
+        ehdr_buf[54..56].try_into().context("ELF ehdr e_phentsize slice mismatch")?,
+    ) as usize;
+    let e_phnum = u16::from_ne_bytes(
+        ehdr_buf[56..58].try_into().context("ELF ehdr e_phnum slice mismatch")?,
+    ) as usize;
 
     let phdr_buf = proc.read_mem(base + e_phoff, e_phentsize * e_phnum)?;
 
@@ -149,9 +148,15 @@ fn parse_remote_elf(proc: &RemoteProcess, base: usize) -> Result<RemoteElfInfo> 
         if off + 56 > phdr_buf.len() {
             break;
         }
-        let p_type = u32::from_ne_bytes(phdr_buf[off..off + 4].try_into().unwrap());
-        let p_vaddr = u64::from_ne_bytes(phdr_buf[off + 16..off + 24].try_into().unwrap()) as usize;
-        let p_memsz = u64::from_ne_bytes(phdr_buf[off + 40..off + 48].try_into().unwrap()) as usize;
+        let p_type = u32::from_ne_bytes(
+            phdr_buf[off..off + 4].try_into().context(format!("ELF phdr[{i}] p_type slice mismatch"))?,
+        );
+        let p_vaddr = u64::from_ne_bytes(
+            phdr_buf[off + 16..off + 24].try_into().context(format!("ELF phdr[{i}] p_vaddr slice mismatch"))?,
+        ) as usize;
+        let p_memsz = u64::from_ne_bytes(
+            phdr_buf[off + 40..off + 48].try_into().context(format!("ELF phdr[{i}] p_memsz slice mismatch"))?,
+        ) as usize;
 
         if p_type == 1 {
             let seg_end = p_vaddr + p_memsz;
@@ -174,8 +179,12 @@ fn parse_remote_elf(proc: &RemoteProcess, base: usize) -> Result<RemoteElfInfo> 
             if doff + 16 > dyn_buf.len() {
                 break;
             }
-            let d_tag = i64::from_ne_bytes(dyn_buf[doff..doff + 8].try_into().unwrap());
-            let d_val = u64::from_ne_bytes(dyn_buf[doff + 8..doff + 16].try_into().unwrap()) as usize;
+            let d_tag = i64::from_ne_bytes(
+                dyn_buf[doff..doff + 8].try_into().context(format!("ELF dyn[{j}] d_tag slice mismatch"))?,
+            );
+            let d_val = u64::from_ne_bytes(
+                dyn_buf[doff + 8..doff + 16].try_into().context(format!("ELF dyn[{j}] d_val slice mismatch"))?,
+            ) as usize;
             match d_tag {
                 0 => break,
                 5 => strtab = d_val,
@@ -216,9 +225,14 @@ fn get_soinfo_offsets_hardcoded(api_level: i32) -> Option<(usize, usize)> {
     }
 }
 
+/// 验证硬编码偏移是否正确
+/// 从 solist 遍历若干节点，检查链表是否可遍历且至少有一个有效 ELF base
+/// 注意：solist 头节点（vdso/linker）的 base 可能为 0，需要跳过
 fn verify_soinfo_offsets(proc: &RemoteProcess, solist: usize, base_offset: usize, next_offset: usize) -> bool {
     let mut trav = solist;
-    for _ in 0..3 {
+    let mut valid_elf_count = 0;
+
+    for _ in 0..5 {
         if trav == 0 {
             break;
         }
@@ -226,15 +240,16 @@ fn verify_soinfo_offsets(proc: &RemoteProcess, solist: usize, base_offset: usize
             Ok(buf) => usize::from_ne_bytes(buf.try_into().unwrap()),
             Err(_) => return false,
         };
-        if !is_valid_elf_base(proc, base) {
-            return false;
+        if is_valid_elf_base(proc, base) {
+            valid_elf_count += 1;
         }
         trav = match proc.read_mem(trav + next_offset, 8) {
             Ok(buf) => usize::from_ne_bytes(buf.try_into().unwrap()),
             Err(_) => return false,
         };
     }
-    true
+
+    valid_elf_count >= 1
 }
 
 /// 动态探测 soinfo 结构体中 base 和 next 字段的偏移
