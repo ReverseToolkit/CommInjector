@@ -1,10 +1,13 @@
-use std::path::Path;
+use fs::OpenOptions;
+use crate::ptrace_ext::RemoteProcess;
 use anyhow::{Context, Result, bail};
 use log::{debug, info, warn};
 use proc_maps::get_process_maps;
+use std::fs;
+use std::io::{Read, Write};
+use std::path::Path;
 use std::process;
-
-use crate::ptrace_ext::RemoteProcess;
+use std::time::SystemTime;
 
 /// 注入结果
 #[derive(Debug)]
@@ -126,19 +129,167 @@ fn remote_dlopen(proc: &RemoteProcess, lib_path: &str, flags: i32) -> Result<usi
     Ok(handle)
 }
 
+/// 通过远程 syscall 调用 memfd_create
+fn remote_memfd_create(proc: &RemoteProcess, name: &str) -> Result<i32> {
+    let pid = proc.pid.as_raw();
+
+    // 写入 name 字符串到远程
+    let name_bytes = name.as_bytes();
+    let name_len = name_bytes.len() + 1;
+    let remote_name = remote_mmap(proc, name_len)?;
+    let mut buf = name_bytes.to_vec();
+    buf.push(0);
+    proc.write_mem(remote_name, &buf)?;
+
+    // aarch64 syscall: x8 = __NR_memfd_create (279), x0 = name, x1 = flags
+    // 通过远程调用 syscall() 函数实现
+    let local_syscall = libc::syscall as usize;
+    let remote_syscall = find_remote_symbol(pid, "libc.so", local_syscall)?;
+
+    let flags = (libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) as usize;
+    let fd = proc.call_function(remote_syscall, &[libc::SYS_memfd_create as usize, remote_name, flags])? as i64 as i32;
+
+    let _ = remote_munmap(proc, remote_name, name_len);
+
+    if fd < 0 {
+        bail!("Remote memfd_create failed, returned {fd}");
+    }
+
+    debug!("remote memfd_create returned fd={fd}");
+    Ok(fd)
+}
+
+/// 通过远程 syscall 对 memfd 执行 fcntl F_ADD_SEALS
+fn remote_memfd_seal(proc: &RemoteProcess, fd: i32) -> Result<()> {
+    let pid = proc.pid.as_raw();
+    let local_syscall = libc::syscall as usize;
+    let remote_syscall = find_remote_symbol(pid, "libc.so", local_syscall)?;
+
+    let seals = (libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE | libc::F_SEAL_SEAL) as usize;
+    proc.call_function(
+        remote_syscall,
+        &[libc::SYS_fcntl as usize, fd as usize, libc::F_ADD_SEALS as usize, seals],
+    )?;
+    Ok(())
+}
+
+/// 使用 memfd_create + android_dlopen_ext 注入
+fn remote_dlopen_memfd(proc: &RemoteProcess, lib_path: &str, flags: i32) -> Result<usize> {
+    let pid = proc.pid.as_raw();
+
+    // 生成随机 memfd 名称
+    let seed = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let memfd_name: String = (0..8)
+        .map(|i| (b'a' + ((seed >> (i * 4)) % 26) as u8) as char)
+        .collect();
+    info!("memfd name: {memfd_name}");
+
+    // 远程 memfd_create
+    let memfd = remote_memfd_create(proc, &memfd_name)?;
+
+    // 从注入器进程通过 /proc/<pid>/fd/<fd> 写入 so 内容
+    let memfd_path = format!("/proc/{pid}/fd/{memfd}");
+    let lib_data = fs::read(lib_path).context("Failed to read library file")?;
+
+    let mut memfd_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&memfd_path)
+        .context(format!("Failed to open {memfd_path}"))?;
+    memfd_file.write_all(&lib_data).context("Failed to write library to memfd")?;
+    memfd_file.flush().context("Failed to flush memfd")?;
+
+    // 验证写入大小
+    let written_size = memfd_file.metadata().map(|m| m.len()).unwrap_or(0);
+    debug!("wrote {} bytes to {memfd_path}, file size={written_size}", lib_data.len());
+    if written_size == 0 {
+        bail!("memfd write failed: file size is 0 after write");
+    }
+    drop(memfd_file);
+
+    // seal memfd
+    let _ = remote_memfd_seal(proc, memfd);
+
+    // 构造 android_dlextinfo 并写入远程内存
+    // struct android_dlextinfo { uint64_t flags; void* reserved_addr; size_t reserved_size; int relro_fd; int library_fd; ... }
+    // ANDROID_DLEXT_USE_LIBRARY_FD = 0x10, library_fd 在 offset 24 (aarch64)
+    let extinfo_size = 48; // android_dlextinfo 足够大
+    let remote_extinfo = remote_mmap(proc, extinfo_size)?;
+
+    let mut extinfo_buf = vec![0u8; extinfo_size];
+    // flags (uint64_t at offset 0) = ANDROID_DLEXT_USE_LIBRARY_FD (0x10)
+    extinfo_buf[..8].copy_from_slice(&0x10u64.to_ne_bytes());
+    // library_fd (int at offset 28) = memfd
+    // struct layout: flags(0:8) reserved_addr(8:16) reserved_size(16:24) relro_fd(24:28) library_fd(28:32)
+    extinfo_buf[28..32].copy_from_slice(&memfd.to_ne_bytes());
+    proc.write_mem(remote_extinfo, &extinfo_buf)?;
+
+    // 写入 memfd name 作为 dlopen 的 filename 参数
+    let name_with_null = format!("{memfd_name}\0");
+    let remote_name = remote_mmap(proc, name_with_null.len())?;
+    proc.write_mem(remote_name, name_with_null.as_bytes())?;
+
+    // 远程调用 android_dlopen_ext(name, flags, &extinfo)
+    let local_dlopen_ext =
+        unsafe { libc::dlsym(libc::RTLD_DEFAULT, b"android_dlopen_ext\0".as_ptr() as *const _) } as usize;
+
+    if local_dlopen_ext == 0 {
+        bail!("android_dlopen_ext not found locally");
+    }
+
+    let remote_dlopen_ext = find_remote_symbol(pid, "libdl.so", local_dlopen_ext)?;
+    debug!("remote android_dlopen_ext: {:#x}", remote_dlopen_ext);
+
+    let handle = proc.call_function(remote_dlopen_ext, &[remote_name, flags as usize, remote_extinfo])?;
+
+    // 清理
+    let _ = remote_munmap(proc, remote_extinfo, extinfo_size);
+    let _ = remote_munmap(proc, remote_name, name_with_null.len());
+
+    if handle == 0 {
+        let local_dlerror = libc::dlerror as usize;
+        if let Ok(remote_dlerror) = find_remote_symbol(pid, "libdl.so", local_dlerror) {
+            if let Ok(err_ptr) = proc.call_function(remote_dlerror, &[]) {
+                if err_ptr != 0 {
+                    if let Ok(err_str) = proc.read_cstring(err_ptr, 256) {
+                        bail!("android_dlopen_ext failed: {err_str}");
+                    }
+                }
+            }
+        }
+        bail!("android_dlopen_ext returned NULL");
+    }
+
+    Ok(handle)
+}
+
 /// 实际注入逻辑，由 inject 调用，错误由 inject 统一处理恢复
-fn do_inject(proc: &RemoteProcess, pid: i32, lib_path: &str) -> Result<InjectedInfo> {
-    let handle = remote_dlopen(proc, lib_path, libc::RTLD_NOW)?;
+fn do_inject(proc: &RemoteProcess, pid: i32, lib_path: &str, use_memfd: bool) -> Result<InjectedInfo> {
+    let handle = if use_memfd {
+        info!("Using memfd injection");
+        remote_dlopen_memfd(proc, lib_path, libc::RTLD_NOW)?
+    } else {
+        remote_dlopen(proc, lib_path, libc::RTLD_NOW)?
+    };
     info!("dlopen returned handle: {:#x}", handle);
 
-    let base_addr = find_remote_lib_base(pid, lib_path)?
-        .or_else(|| {
-            Path::new(lib_path)
-                .file_name()
-                .and_then(|name| name.to_str())
-                .and_then(|name| find_remote_lib_base(pid, name).ok().flatten())
-        })
-        .unwrap_or(0);
+    let base_addr = if use_memfd {
+        // memfd 加载后 maps 里显示 /memfd:xxx，用文件名不好找，直接搜 handle 对应的映射
+        // 也可以尝试搜 memfd 名称
+        find_remote_lib_base(pid, "memfd:")?.unwrap_or(0)
+    } else {
+        find_remote_lib_base(pid, lib_path)?
+            .or_else(|| {
+                Path::new(lib_path)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(|name| find_remote_lib_base(pid, name).ok().flatten())
+            })
+            .unwrap_or(0)
+    };
 
     if base_addr != 0 {
         info!("Library loaded at base: {:#x}", base_addr);
@@ -160,7 +311,7 @@ fn do_inject(proc: &RemoteProcess, pid: i32, lib_path: &str) -> Result<InjectedI
 /// 3. 远程调用 dlopen 加载 so
 /// 4. SIGCONT 恢复目标进程
 /// 5. ptrace detach
-pub fn inject(pid: i32, lib_path: &str) -> Result<InjectedInfo> {
+pub fn inject(pid: i32, lib_path: &str, use_memfd: bool) -> Result<InjectedInfo> {
     info!("Injecting {} into pid {}", lib_path, pid);
 
     // 验证 so 文件存在
@@ -195,7 +346,7 @@ pub fn inject(pid: i32, lib_path: &str) -> Result<InjectedInfo> {
     }
 
     // 执行注入，无论成功失败都必须恢复进程
-    let result = do_inject(&proc, pid, lib_path);
+    let result = do_inject(&proc, pid, lib_path, use_memfd);
 
     // 恢复目标进程
     if stopped {

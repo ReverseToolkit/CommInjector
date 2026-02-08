@@ -27,6 +27,10 @@ struct Args {
     /// 等待进程就绪的超时时间（秒）
     #[arg(short, long, default_value_t = 5)]
     timeout: u64,
+
+    /// 使用 memfd_create + android_dlopen_ext 注入，绕过路径限制
+    #[arg(long)]
+    memfd: bool,
 }
 
 fn main() -> Result<()> {
@@ -47,7 +51,7 @@ fn main() -> Result<()> {
         match wait_for_proc_ready(event.pid, Duration::from_secs(args.timeout)) {
             Ok(true) => {
                 info!("pid {} ready, injecting...", event.pid);
-                match injector::inject(event.pid, &args.lib) {
+                match injector::inject(event.pid, &args.lib, args.memfd) {
                     Ok(info) => info!("Injection succeeded! handle={:#x} base={:#x}", info.dl_handle, info.base_addr),
                     Err(e) => warn!("Injection failed: {e:#}"),
                 }
