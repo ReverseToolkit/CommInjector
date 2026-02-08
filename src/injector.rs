@@ -1,3 +1,4 @@
+use std::path::Path;
 use anyhow::{Context, Result, bail};
 use log::{debug, info, warn};
 use proc_maps::get_process_maps;
@@ -56,7 +57,7 @@ fn remote_mmap(proc: &RemoteProcess, size: usize) -> Result<usize> {
 
     debug!("remote mmap: {:#x}", remote_mmap);
 
-    let addr = proc.call_remote_fn(
+    let addr = proc.call_function(
         remote_mmap,
         &[
             0,                                                  // addr = NULL
@@ -81,7 +82,7 @@ fn remote_munmap(proc: &RemoteProcess, addr: usize, size: usize) -> Result<()> {
     let local_munmap = libc::munmap as usize;
     let remote_munmap = find_remote_symbol(proc.pid.as_raw(), "libc.so", local_munmap)?;
 
-    proc.call_remote_fn(remote_munmap, &[addr, size])?;
+    proc.call_function(remote_munmap, &[addr, size])?;
     Ok(())
 }
 
@@ -102,7 +103,7 @@ fn remote_dlopen(proc: &RemoteProcess, lib_path: &str, flags: i32) -> Result<usi
     proc.write_mem(remote_path, &buf)?;
 
     // 调用 dlopen
-    let handle = proc.call_remote_fn(remote_dlopen, &[remote_path, flags as usize])?;
+    let handle = proc.call_function(remote_dlopen, &[remote_path, flags as usize])?;
 
     // 清理路径内存
     let _ = remote_munmap(proc, remote_path, path_len);
@@ -111,7 +112,7 @@ fn remote_dlopen(proc: &RemoteProcess, lib_path: &str, flags: i32) -> Result<usi
         // 尝试获取 dlerror
         let local_dlerror = libc::dlerror as usize;
         if let Ok(remote_dlerror) = find_remote_symbol(proc.pid.as_raw(), "libdl.so", local_dlerror) {
-            if let Ok(err_ptr) = proc.call_remote_fn(remote_dlerror, &[]) {
+            if let Ok(err_ptr) = proc.call_function(remote_dlerror, &[]) {
                 if err_ptr != 0 {
                     if let Ok(err_str) = proc.read_cstring(err_ptr, 256) {
                         bail!("dlopen failed: {err_str}");
@@ -123,6 +124,32 @@ fn remote_dlopen(proc: &RemoteProcess, lib_path: &str, flags: i32) -> Result<usi
     }
 
     Ok(handle)
+}
+
+/// 实际注入逻辑，由 inject 调用，错误由 inject 统一处理恢复
+fn do_inject(proc: &RemoteProcess, pid: i32, lib_path: &str) -> Result<InjectedInfo> {
+    let handle = remote_dlopen(proc, lib_path, libc::RTLD_NOW)?;
+    info!("dlopen returned handle: {:#x}", handle);
+
+    let base_addr = find_remote_lib_base(pid, lib_path)?
+        .or_else(|| {
+            Path::new(lib_path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| find_remote_lib_base(pid, name).ok().flatten())
+        })
+        .unwrap_or(0);
+
+    if base_addr != 0 {
+        info!("Library loaded at base: {:#x}", base_addr);
+    } else {
+        warn!("Could not find library base address in maps");
+    }
+
+    Ok(InjectedInfo {
+        dl_handle: handle,
+        base_addr,
+    })
 }
 
 /// 注入 so 到目标进程
@@ -137,7 +164,7 @@ pub fn inject(pid: i32, lib_path: &str) -> Result<InjectedInfo> {
     info!("Injecting {} into pid {}", lib_path, pid);
 
     // 验证 so 文件存在
-    if !std::path::Path::new(lib_path).exists() {
+    if !Path::new(lib_path).exists() {
         bail!("Library not found: {lib_path}");
     }
 
@@ -154,26 +181,21 @@ pub fn inject(pid: i32, lib_path: &str) -> Result<InjectedInfo> {
     let mut proc = RemoteProcess::attach(pid)?;
     info!("Attached to pid {}", pid);
 
-    // 远程 dlopen
-    let handle = remote_dlopen(&proc, lib_path, libc::RTLD_NOW)?;
-    info!("dlopen returned handle: {:#x}", handle);
-
-    // 查找注入后的 so 基址
-    let base_addr = find_remote_lib_base(pid, lib_path)?
-        .or_else(|| {
-            // 尝试用文件名查找
-            std::path::Path::new(lib_path)
-                .file_name()
-                .and_then(|name| name.to_str())
-                .and_then(|name| find_remote_lib_base(pid, name).ok().flatten())
-        })
+    // 设置 default_caller：用系统 so 基址作为远程函数调用的返回地址（LR）
+    // 这样 cont 后命中该地址会触发 SIGSEGV，被我们捕获
+    // refs: https://fadeevab.com/shared-library-injection-on-android-8/
+    let caller = find_remote_lib_base(pid, "libRS.so")?
+        .or_else(|| find_remote_lib_base(pid, "libc.so").ok().flatten())
         .unwrap_or(0);
-
-    if base_addr != 0 {
-        info!("Library loaded at base: {:#x}", base_addr);
+    if caller != 0 {
+        debug!("default_caller set to {:#x}", caller);
+        proc.set_default_caller(caller);
     } else {
-        warn!("Could not find library base address in maps");
+        warn!("Could not find a suitable default_caller, remote calls may fail");
     }
+
+    // 执行注入，无论成功失败都必须恢复进程
+    let result = do_inject(&proc, pid, lib_path);
 
     // 恢复目标进程
     if stopped {
@@ -181,12 +203,8 @@ pub fn inject(pid: i32, lib_path: &str) -> Result<InjectedInfo> {
         debug!("Resumed target process");
     }
 
-    // detach（恢复寄存器）
     proc.detach()?;
     info!("Detached from pid {}", pid);
 
-    Ok(InjectedInfo {
-        dl_handle: handle,
-        base_addr,
-    })
+    result
 }

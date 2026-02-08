@@ -11,3 +11,4 @@
 /.opencode
 /.claude
 /.trae
+/test-payload/libpayload.so
