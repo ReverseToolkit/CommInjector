@@ -22,12 +22,4 @@ libc = "1.0.0-alpha.2"
 
 [dependencies.nix]
 version = "0.31.1"
-features = [
-    "signal",
-    "pthread",
-    "ptrace",
-    "inotify",
-    "poll",
-    "uio",
-    "process",
-]
+features = ["signal", "pthread", "ptrace", "inotify", "poll", "uio", "process", "mman", "socket"]

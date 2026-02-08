@@ -3,6 +3,7 @@ mod injector;
 mod proc_monitor;
 mod ptrace_ex;
 mod ptrace_ext;
+pub(crate) mod wuwa;
 
 use std::os::fd::AsFd;
 use std::os::unix::prelude::OsStrExt;
@@ -19,6 +20,8 @@ use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify};
 enum HiderKind {
     Maps,
     Solist,
+    KernelMaps,
+    KernelSignal,
 }
 
 #[derive(Parser)]
@@ -59,6 +62,8 @@ fn build_hiders(kinds: &[HiderKind]) -> Vec<Box<dyn hider::Hider>> {
             match k {
                 HiderKind::Maps => Box::new(hider::maps::MapsHider),
                 HiderKind::Solist => Box::new(hider::solist::SolistHider),
+                HiderKind::KernelMaps => Box::new(hider::kernel_maps::KernelMapsHider),
+                HiderKind::KernelSignal => Box::new(hider::kernel_signal::KernelSignalHider),
             }
         })
         .collect()
@@ -74,13 +79,19 @@ fn main() -> Result<()> {
     info!("Waiting for {} to start...", cli.package);
 
     proc_monitor::monitor_proc_start(|event| {
-        debug!("proc_start: pid={} uid={} name={}", event.pid, event.uid, event.process_name);
+        debug!(
+            "proc_start: pid={} uid={} name={}",
+            event.pid, event.uid, event.process_name
+        );
 
         if event.process_name != cli.package {
             return false;
         }
 
-        info!("Target found: pid={} uid={} name={}", event.pid, event.uid, event.process_name);
+        info!(
+            "Target found: pid={} uid={} name={}",
+            event.pid, event.uid, event.process_name
+        );
 
         match wait_for_proc_ready(event.pid, Duration::from_secs(cli.timeout)) {
             Ok(true) => {
@@ -97,10 +108,10 @@ fn main() -> Result<()> {
                             "Injection succeeded! handle={:#x} base={:#x} {hider_summary}",
                             info.dl_handle, info.base_addr
                         );
-                    }
+                    },
                     Err(e) => warn!("Injection failed: {e:#}"),
                 }
-            }
+            },
             Ok(false) => warn!("pid {} exited or timeout", event.pid),
             Err(e) => warn!("wait_for_proc_ready failed: {e:#}"),
         }
@@ -137,7 +148,7 @@ fn wait_for_proc_ready(pid: i32, timeout: Duration) -> Result<bool> {
         match poll(&mut poll_fds, timeout) {
             Ok(0) => return Ok(false),
             Err(e) => return Err(e).context("poll failed"),
-            _ => {}
+            _ => {},
         }
 
         let events = inotify.read_events().context("inotify read failed")?;

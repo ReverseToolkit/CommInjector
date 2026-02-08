@@ -118,12 +118,7 @@ fn do_inject(
 
     let mut hider_results = Vec::new();
     if load.base_addr != 0 {
-        let target = HideTarget {
-            proc,
-            pid,
-            base_addr: load.base_addr,
-            maps_search_name: &load.maps_search_name,
-        };
+        let target = HideTarget::new(proc, pid, load.base_addr, &load.maps_search_name)?;
         for hider in hiders {
             let name = hider.name().to_string();
             match hider.apply(&target) {
