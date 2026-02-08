@@ -131,6 +131,131 @@ static void dump_anon_exec(void) {
     }
 }
 
+static void dump_suspicious_fds(void) {
+    DIR *dir = opendir("/proc/self/fd");
+    if (!dir) {
+        __android_log_print(ANDROID_LOG_WARN, TAG, "fd check: failed to open /proc/self/fd");
+        return;
+    }
+
+    int found = 0;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_name[0] == '.') continue;
+
+        char link_path[128];
+        char target[512];
+        snprintf(link_path, sizeof(link_path), "/proc/self/fd/%s", entry->d_name);
+
+        ssize_t len = readlink(link_path, target, sizeof(target) - 1);
+        if (len <= 0) continue;
+        target[len] = '\0';
+
+        // 检查 memfd（排除 jit）或 payload 相关
+        if ((strstr(target, "memfd:") && !strstr(target, "jit-")) ||
+            strstr(target, "payload")) {
+            __android_log_print(ANDROID_LOG_WARN, TAG, "fd VISIBLE: fd=%s -> %s", entry->d_name, target);
+            found++;
+        }
+    }
+    closedir(dir);
+
+    if (found == 0) {
+        __android_log_print(ANDROID_LOG_INFO, TAG, "fd check: no suspicious fds found (OK)");
+    } else {
+        __android_log_print(ANDROID_LOG_WARN, TAG, "fd check: found %d suspicious fds", found);
+    }
+}
+
+static void dump_suspicious_threads(void) {
+    DIR *dir = opendir("/proc/self/task");
+    if (!dir) {
+        __android_log_print(ANDROID_LOG_WARN, TAG, "thread check: failed to open /proc/self/task");
+        return;
+    }
+
+    int total = 0;
+    int suspicious = 0;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_name[0] == '.') continue;
+        total++;
+
+        char comm_path[128];
+        snprintf(comm_path, sizeof(comm_path), "/proc/self/task/%s/comm", entry->d_name);
+
+        FILE *fp = fopen(comm_path, "r");
+        if (!fp) continue;
+
+        char comm[64] = {0};
+        if (fgets(comm, sizeof(comm), fp)) {
+            char *nl = strchr(comm, '\n');
+            if (nl) *nl = '\0';
+        }
+        fclose(fp);
+
+        // 检查异常线程名
+        if (strstr(comm, "inject") || strstr(comm, "payload") || strstr(comm, "ptrace")) {
+            __android_log_print(ANDROID_LOG_WARN, TAG, "thread SUSPICIOUS: tid=%s comm=%s", entry->d_name, comm);
+            suspicious++;
+        }
+    }
+    closedir(dir);
+
+    __android_log_print(ANDROID_LOG_INFO, TAG, "thread check: %d threads total, %d suspicious", total, suspicious);
+}
+
+static void dump_elf_in_anon(void) {
+    static const unsigned char elf_magic[4] = { 0x7f, 'E', 'L', 'F' };
+
+    char line[512];
+    FILE *fp = fopen("/proc/self/maps", "r");
+    if (!fp) return;
+
+    int found = 0;
+    while (fgets(line, sizeof(line), fp)) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = '\0';
+
+        // 解析地址范围
+        unsigned long start, end;
+        char perms[8] = {0};
+        if (sscanf(line, "%lx-%lx %4s", &start, &end, perms) != 3) continue;
+
+        // 只检查可读的匿名映射
+        if (perms[0] != 'r') continue;
+
+        // 跳过有文件路径的
+        char *last_field = strrchr(line, ' ');
+        if (last_field) {
+            last_field++;
+            if (last_field[0] == '/' || last_field[0] == '[') continue;
+        }
+
+        // 跳过 jit
+        if (strstr(line, "jit-")) continue;
+
+        // 跳过太大的区域（避免扫描耗时过长）
+        unsigned long size = end - start;
+        if (size > 64 * 1024 * 1024) continue;
+
+        // 检查开头是否是 ELF magic
+        const unsigned char *mem = (const unsigned char *)start;
+        if (size >= 4 && memcmp(mem, elf_magic, 4) == 0) {
+            __android_log_print(ANDROID_LOG_WARN, TAG,
+                "elf_in_anon: ELF header at %lx-%lx (%s) size=%lu", start, end, perms, size);
+            found++;
+        }
+    }
+    fclose(fp);
+
+    if (found == 0) {
+        __android_log_print(ANDROID_LOG_INFO, TAG, "elf_in_anon check: no ELF in anonymous memory (OK)");
+    } else {
+        __android_log_print(ANDROID_LOG_WARN, TAG, "elf_in_anon check: found %d ELF headers in anonymous memory", found);
+    }
+}
+
 __attribute__((constructor))
 static void init(void) {
     __android_log_print(ANDROID_LOG_INFO, TAG,
@@ -148,6 +273,9 @@ int JNI_OnLoad(void *vm, void *reserved) {
     dump_self_maps();
     dump_solist();
     dump_anon_exec();
+    dump_suspicious_fds();
+    dump_suspicious_threads();
+    dump_elf_in_anon();
 
     pthread_t tid;
     pthread_create(&tid, NULL, counter_thread, NULL);
