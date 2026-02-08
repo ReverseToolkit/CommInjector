@@ -31,6 +31,10 @@ struct Args {
     /// 使用 memfd_create + android_dlopen_ext 注入，绕过路径限制
     #[arg(long)]
     memfd: bool,
+
+    /// 注入后隐藏库在 /proc/pid/maps 中的痕迹
+    #[arg(long)]
+    hide_maps: bool,
 }
 
 fn main() -> Result<()> {
@@ -51,8 +55,13 @@ fn main() -> Result<()> {
         match wait_for_proc_ready(event.pid, Duration::from_secs(args.timeout)) {
             Ok(true) => {
                 info!("pid {} ready, injecting...", event.pid);
-                match injector::inject(event.pid, &args.lib, args.memfd) {
-                    Ok(info) => info!("Injection succeeded! handle={:#x} base={:#x}", info.dl_handle, info.base_addr),
+                match injector::inject(event.pid, &args.lib, args.memfd, args.hide_maps) {
+                    Ok(info) => {
+                        info!(
+                            "Injection succeeded! handle={:#x} base={:#x} maps_hidden={}",
+                            info.dl_handle, info.base_addr, info.maps_hidden
+                        );
+                    }
                     Err(e) => warn!("Injection failed: {e:#}"),
                 }
             }

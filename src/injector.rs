@@ -14,12 +14,20 @@ use std::time::SystemTime;
 pub struct InjectedInfo {
     pub dl_handle: usize,
     pub base_addr: usize,
+    pub maps_hidden: bool,
 }
 
 impl InjectedInfo {
     pub fn is_valid(&self) -> bool {
         self.dl_handle != 0 && self.base_addr != 0
     }
+}
+
+/// 库在远程进程中的一个内存段
+struct LibSegment {
+    start: usize,
+    size: usize,
+    prot: i32,
 }
 
 /// 在远程进程中查找某个 so 的基址
@@ -87,6 +95,109 @@ fn remote_munmap(proc: &RemoteProcess, addr: usize, size: usize) -> Result<()> {
 
     proc.call_function(remote_munmap, &[addr, size])?;
     Ok(())
+}
+
+/// 通过远程 syscall 调用 mmap（支持 MAP_FIXED）
+fn remote_mmap_fixed(proc: &RemoteProcess, addr: usize, size: usize, prot: i32) -> Result<usize> {
+    let pid = proc.pid.as_raw();
+    let local_syscall = libc::syscall as usize;
+    let remote_syscall = find_remote_symbol(pid, "libc.so", local_syscall)?;
+
+    let flags = (libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED) as usize;
+    let ret = proc.call_function(
+        remote_syscall,
+        &[libc::SYS_mmap as usize, addr, size, prot as usize, flags, 0, 0],
+    )?;
+
+    if ret == usize::MAX || ret == 0 {
+        bail!("Remote mmap MAP_FIXED failed at {:#x}, returned {:#x}", addr, ret);
+    }
+    Ok(ret)
+}
+
+/// 查找注入库在远程进程中的所有内存段
+fn find_remote_lib_segments(pid: i32, lib_name: &str) -> Result<Vec<LibSegment>> {
+    let maps = get_process_maps(pid).context("Failed to read remote maps")?;
+    let mut segments = Vec::new();
+
+    for map in &maps {
+        let path = match map.filename() {
+            Some(p) => p.to_string_lossy(),
+            None => continue,
+        };
+
+        if !path.contains(lib_name) {
+            continue;
+        }
+
+        let prot = {
+            let mut p = 0i32;
+            if map.is_read() {
+                p |= libc::PROT_READ;
+            }
+            if map.is_write() {
+                p |= libc::PROT_WRITE;
+            }
+            if map.is_exec() {
+                p |= libc::PROT_EXEC;
+            }
+            p
+        };
+
+        segments.push(LibSegment {
+            start: map.start(),
+            size: map.size(),
+            prot,
+        });
+    }
+
+    Ok(segments)
+}
+
+/// 隐藏注入库在 /proc/pid/maps 中的痕迹
+///
+/// 原理（来自 Riru）：
+/// 对每个 segment：备份内存 → munmap → mmap anonymous 到同一地址 → 恢复内存
+/// 结果：内存内容不变，但 maps 中显示为匿名映射而非库文件路径
+fn hide_library_from_maps(proc: &RemoteProcess, pid: i32, lib_name: &str) -> Result<bool> {
+    let segments = find_remote_lib_segments(pid, lib_name)?;
+    if segments.is_empty() {
+        warn!("hide_maps: no segments found for {lib_name}");
+        return Ok(false);
+    }
+
+    for seg in &segments {
+        debug!("hide_maps: hiding segment {:#x} - {:#x} (size={})", seg.start, seg.start + seg.size, seg.size);
+
+        // 备份 segment 内容
+        let backup = proc.read_mem(seg.start, seg.size)?;
+
+        // munmap 原始映射
+        remote_munmap(proc, seg.start, seg.size)?;
+
+        // 在同一地址重新 mmap 匿名映射
+        let new_addr = remote_mmap_fixed(proc, seg.start, seg.size, libc::PROT_READ | libc::PROT_WRITE)?;
+        if new_addr != seg.start {
+            warn!("hide_maps: mmap returned {:#x}, expected {:#x}", new_addr, seg.start);
+        }
+
+        // 恢复内容
+        proc.write_mem(seg.start, &backup)?;
+
+        // 恢复原始保护属性（写入完成后再设置，因为可能是 r-x）
+        if seg.prot != (libc::PROT_READ | libc::PROT_WRITE) {
+            let pid_raw = proc.pid.as_raw();
+            let local_syscall = libc::syscall as usize;
+            let remote_syscall = find_remote_symbol(pid_raw, "libc.so", local_syscall)?;
+            proc.call_function(
+                remote_syscall,
+                &[libc::SYS_mprotect as usize, seg.start, seg.size, seg.prot as usize],
+            )?;
+        }
+    }
+
+    info!("hide_maps: hidden {} segments", segments.len());
+    Ok(true)
 }
 
 /// 在远程进程中调用 dlopen
@@ -173,8 +284,20 @@ fn remote_memfd_seal(proc: &RemoteProcess, fd: i32) -> Result<()> {
     Ok(())
 }
 
+/// 远程 close 一个 fd
+fn remote_close(proc: &RemoteProcess, fd: i32) -> Result<()> {
+    let pid = proc.pid.as_raw();
+    let local_syscall = libc::syscall as usize;
+    let remote_syscall = find_remote_symbol(pid, "libc.so", local_syscall)?;
+
+    proc.call_function(remote_syscall, &[libc::SYS_close as usize, fd as usize])?;
+    debug!("remote close fd={fd}");
+    Ok(())
+}
+
 /// 使用 memfd_create + android_dlopen_ext 注入
-fn remote_dlopen_memfd(proc: &RemoteProcess, lib_path: &str, flags: i32) -> Result<usize> {
+/// 返回 (dl_handle, memfd_fd, memfd_name)
+fn remote_dlopen_memfd(proc: &RemoteProcess, lib_path: &str, flags: i32) -> Result<(usize, i32, String)> {
     let pid = proc.pid.as_raw();
 
     // 生成随机 memfd 名称
@@ -263,32 +386,57 @@ fn remote_dlopen_memfd(proc: &RemoteProcess, lib_path: &str, flags: i32) -> Resu
         bail!("android_dlopen_ext returned NULL");
     }
 
-    Ok(handle)
+    Ok((handle, memfd, memfd_name))
+}
+
+/// 远程调用 dlsym 查找符号
+fn remote_dlsym(proc: &RemoteProcess, handle: usize, symbol: &str) -> Result<usize> {
+    let pid = proc.pid.as_raw();
+    let local_dlsym = libc::dlsym as usize;
+    let remote_dlsym = find_remote_symbol(pid, "libdl.so", local_dlsym)?;
+
+    let sym_with_null = format!("{symbol}\0");
+    let remote_sym = remote_mmap(proc, sym_with_null.len())?;
+    proc.write_mem(remote_sym, sym_with_null.as_bytes())?;
+
+    let addr = proc.call_function(remote_dlsym, &[handle, remote_sym])?;
+
+    let _ = remote_munmap(proc, remote_sym, sym_with_null.len());
+
+    Ok(addr)
 }
 
 /// 实际注入逻辑，由 inject 调用，错误由 inject 统一处理恢复
-fn do_inject(proc: &RemoteProcess, pid: i32, lib_path: &str, use_memfd: bool) -> Result<InjectedInfo> {
-    let handle = if use_memfd {
+fn do_inject(proc: &RemoteProcess, pid: i32, lib_path: &str, use_memfd: bool, hide_maps: bool) -> Result<InjectedInfo> {
+    let (handle, memfd_fd, memfd_name) = if use_memfd {
         info!("Using memfd injection");
-        remote_dlopen_memfd(proc, lib_path, libc::RTLD_NOW)?
+        let (h, fd, name) = remote_dlopen_memfd(proc, lib_path, libc::RTLD_NOW)?;
+        (h, Some(fd), Some(name))
     } else {
-        remote_dlopen(proc, lib_path, libc::RTLD_NOW)?
+        let h = remote_dlopen(proc, lib_path, libc::RTLD_NOW)?;
+        (h, None, None)
     };
     info!("dlopen returned handle: {:#x}", handle);
 
-    let base_addr = if use_memfd {
-        // memfd 加载后 maps 里显示 /memfd:xxx，用文件名不好找，直接搜 handle 对应的映射
-        // 也可以尝试搜 memfd 名称
-        find_remote_lib_base(pid, "memfd:")?.unwrap_or(0)
+    let (base_addr, maps_search_name) = if let Some(ref name) = memfd_name {
+        let search = format!("memfd:{name}");
+        let base = find_remote_lib_base(pid, &search)?.unwrap_or(0);
+        (base, search)
     } else {
-        find_remote_lib_base(pid, lib_path)?
+        let base = find_remote_lib_base(pid, lib_path)?
             .or_else(|| {
                 Path::new(lib_path)
                     .file_name()
                     .and_then(|name| name.to_str())
                     .and_then(|name| find_remote_lib_base(pid, name).ok().flatten())
             })
-            .unwrap_or(0)
+            .unwrap_or(0);
+        let search_name = Path::new(lib_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(lib_path)
+            .to_string();
+        (base, search_name)
     };
 
     if base_addr != 0 {
@@ -297,9 +445,36 @@ fn do_inject(proc: &RemoteProcess, pid: i32, lib_path: &str, use_memfd: bool) ->
         warn!("Could not find library base address in maps");
     }
 
+    let maps_hidden = if hide_maps && base_addr != 0 {
+        match hide_library_from_maps(proc, pid, &maps_search_name) {
+            Ok(true) => {
+                info!("Library segments hidden from maps");
+                true
+            }
+            Ok(false) => {
+                warn!("Failed to hide library segments from maps");
+                false
+            }
+            Err(e) => {
+                warn!("hide_maps error: {e:#}");
+                false
+            }
+        }
+    } else {
+        false
+    };
+
+    // 关闭 memfd fd，避免在 /proc/pid/fd/ 中留下痕迹
+    if let Some(fd) = memfd_fd {
+        if let Err(e) = remote_close(proc, fd) {
+            warn!("Failed to close memfd fd: {e:#}");
+        }
+    }
+
     Ok(InjectedInfo {
         dl_handle: handle,
         base_addr,
+        maps_hidden,
     })
 }
 
@@ -309,9 +484,11 @@ fn do_inject(proc: &RemoteProcess, pid: i32, lib_path: &str, use_memfd: bool) ->
 /// 1. SIGSTOP 暂停目标进程
 /// 2. ptrace attach
 /// 3. 远程调用 dlopen 加载 so
-/// 4. SIGCONT 恢复目标进程
-/// 5. ptrace detach
-pub fn inject(pid: i32, lib_path: &str, use_memfd: bool) -> Result<InjectedInfo> {
+/// 4. hide_maps / close memfd
+/// 5. SIGCONT 恢复目标进程
+/// 6. 远程调用 entry_point
+/// 7. ptrace detach
+pub fn inject(pid: i32, lib_path: &str, use_memfd: bool, hide_maps: bool) -> Result<InjectedInfo> {
     info!("Injecting {} into pid {}", lib_path, pid);
 
     // 验证 so 文件存在
@@ -346,15 +523,33 @@ pub fn inject(pid: i32, lib_path: &str, use_memfd: bool) -> Result<InjectedInfo>
     }
 
     // 执行注入，无论成功失败都必须恢复进程
-    let result = do_inject(&proc, pid, lib_path, use_memfd);
+    let result = do_inject(&proc, pid, lib_path, use_memfd, hide_maps);
 
-    // 恢复目标进程
+    // 注入成功时：在 ptrace 下直接调用 JNI_OnLoad（不需要 SIGCONT）
+    if let Ok(ref info) = result {
+        if info.is_valid() {
+            match remote_dlsym(&proc, info.dl_handle, "JNI_OnLoad") {
+                Ok(ep) if ep != 0 => {
+                    info!("Calling JNI_OnLoad at {:#x}", ep);
+                    if let Err(e) = proc.call_function(ep, &[]) {
+                        warn!("JNI_OnLoad call failed: {e:#}");
+                    }
+                }
+                _ => {
+                    debug!("No JNI_OnLoad symbol found, skipping");
+                }
+            }
+        }
+    }
+
+    // 先 detach 再 SIGCONT，避免被检测到 ptrace
+    proc.detach()?;
+    info!("Detached from pid {}", pid);
+
     if stopped {
         let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), nix::sys::signal::Signal::SIGCONT);
         debug!("Resumed target process");
     }
-
-    proc.detach()?;
     info!("Detached from pid {}", pid);
 
     result
