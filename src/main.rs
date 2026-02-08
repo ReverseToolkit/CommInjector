@@ -1,5 +1,7 @@
+mod hider;
 mod injector;
 mod proc_monitor;
+mod ptrace_ex;
 mod ptrace_ext;
 
 use std::os::fd::AsFd;
@@ -8,14 +10,20 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, Subcommand, ValueEnum};
 use log::{debug, info, warn};
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify};
 
+#[derive(Clone, ValueEnum)]
+enum HiderKind {
+    Maps,
+    Solist,
+}
+
 #[derive(Parser)]
 #[command(name = "injector", about = "Android process injector")]
-struct Args {
+struct Cli {
     /// 目标包名
     #[arg(short, long)]
     package: String,
@@ -28,38 +36,66 @@ struct Args {
     #[arg(short, long, default_value_t = 5)]
     timeout: u64,
 
-    /// 使用 memfd_create + android_dlopen_ext 注入，绕过路径限制
-    #[arg(long)]
-    memfd: bool,
+    /// 启用的隐藏器，可多次指定
+    #[arg(long = "hider", value_enum)]
+    hiders: Vec<HiderKind>,
 
-    /// 注入后隐藏库在 /proc/pid/maps 中的痕迹
-    #[arg(long)]
-    hide_maps: bool,
+    #[command(subcommand)]
+    method: InjectMethod,
+}
+
+#[derive(Subcommand)]
+enum InjectMethod {
+    /// 使用标准 dlopen 注入
+    Dlopen,
+    /// 使用 memfd_create + android_dlopen_ext 注入，绕过路径限制
+    Memfd,
+}
+
+fn build_hiders(kinds: &[HiderKind]) -> Vec<Box<dyn hider::Hider>> {
+    kinds
+        .iter()
+        .map(|k| -> Box<dyn hider::Hider> {
+            match k {
+                HiderKind::Maps => Box::new(hider::maps::MapsHider),
+                HiderKind::Solist => Box::new(hider::solist::SolistHider),
+            }
+        })
+        .collect()
 }
 
 fn main() -> Result<()> {
     env_logger::init();
-    let args = Args::parse();
+    let cli = Cli::parse();
 
-    info!("Waiting for {} to start...", args.package);
+    let use_memfd = matches!(cli.method, InjectMethod::Memfd);
+    let hiders = build_hiders(&cli.hiders);
+
+    info!("Waiting for {} to start...", cli.package);
 
     proc_monitor::monitor_proc_start(|event| {
         debug!("proc_start: pid={} uid={} name={}", event.pid, event.uid, event.process_name);
 
-        if event.process_name != args.package {
+        if event.process_name != cli.package {
             return false;
         }
 
         info!("Target found: pid={} uid={} name={}", event.pid, event.uid, event.process_name);
 
-        match wait_for_proc_ready(event.pid, Duration::from_secs(args.timeout)) {
+        match wait_for_proc_ready(event.pid, Duration::from_secs(cli.timeout)) {
             Ok(true) => {
                 info!("pid {} ready, injecting...", event.pid);
-                match injector::inject(event.pid, &args.lib, args.memfd, args.hide_maps) {
+                match injector::inject(event.pid, &cli.lib, use_memfd, &hiders) {
                     Ok(info) => {
+                        let hider_summary: String = info
+                            .hider_results
+                            .iter()
+                            .map(|(name, ok)| format!("{name}={ok}"))
+                            .collect::<Vec<_>>()
+                            .join(" ");
                         info!(
-                            "Injection succeeded! handle={:#x} base={:#x} maps_hidden={}",
-                            info.dl_handle, info.base_addr, info.maps_hidden
+                            "Injection succeeded! handle={:#x} base={:#x} {hider_summary}",
+                            info.dl_handle, info.base_addr
                         );
                     }
                     Err(e) => warn!("Injection failed: {e:#}"),
@@ -69,11 +105,10 @@ fn main() -> Result<()> {
             Err(e) => warn!("wait_for_proc_ready failed: {e:#}"),
         }
 
-        true // 停止监听
+        true
     })
 }
 
-/// 等待进程初始化就绪
 fn wait_for_proc_ready(pid: i32, timeout: Duration) -> Result<bool> {
     let proc_dir = format!("/proc/{pid}");
 
@@ -102,7 +137,7 @@ fn wait_for_proc_ready(pid: i32, timeout: Duration) -> Result<bool> {
         match poll(&mut poll_fds, timeout) {
             Ok(0) => return Ok(false),
             Err(e) => return Err(e).context("poll failed"),
-            _ => {},
+            _ => {}
         }
 
         let events = inotify.read_events().context("inotify read failed")?;
@@ -113,12 +148,10 @@ fn wait_for_proc_ready(pid: i32, timeout: Duration) -> Result<bool> {
                 None => continue,
             };
 
-            // skip fd event (0x6466 = "fd" little-endian)
             if name.len() >= 2 && u16::from_le_bytes([name[0], name[1]]) == 0x6466 {
                 continue;
             }
 
-            // skip timerslack event (0x656d6974 = "time" little-endian)
             if name.len() >= 4 && u32::from_le_bytes([name[0], name[1], name[2], name[3]]) == 0x656d6974 {
                 continue;
             }

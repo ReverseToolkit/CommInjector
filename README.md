@@ -14,9 +14,12 @@ Android 平台进程注入工具，使用 Rust 编写，通过 NDK 交叉编译�
 ## 致谢
 
 - 进程监控（`proc_monitor`）的实现参考了 [vvb2060](https://github.com/vvb2060) 提供的代码：[am_proc_start.cpp](https://gist.github.com/vvb2060/a3d40084cd9273b65a15f8a351b4eb0e#file-am_proc_start-cpp)
-- [xDL](https://github.com/nicedayzhu/xDL) — Android 动态链接器加载库
+- [xDL](https://github.com/nicedayzhu/xDL) — Android 动态链接器增强库
 - [KittyMemoryEx](https://github.com/MJx0/KittyMemoryEx) — Android 内存工具库
-- [AndKittyInjector](https://github.com/MJx0/AndKittyInjector) — Android 进程注入工具
+- [AndKittyInjector](https://github.com/MJx0/AndKittyInjector) — soinfo 动态探测技术参考
+- [fake-linker](https://github.com/nicedayzhu/fake-linker) — soinfo 硬编码偏移参考（各 Android 版本）
+- [Riru](https://github.com/RikkaApps/Riru) — maps 隐藏（remap 匿名映射）技术参考
+- [fadeevab](https://fadeevab.com/shared-library-injection-on-android-8/) — default_caller / LR 远程函数调用技术参考
 
 ## License
 

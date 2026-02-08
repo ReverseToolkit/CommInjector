@@ -1,5 +1,6 @@
 use std::ffi::c_void;
-use std::io::{IoSlice, IoSliceMut};
+use std::fs::OpenOptions;
+use std::io::{IoSlice, IoSliceMut, Seek, SeekFrom, Write};
 use std::mem;
 
 use anyhow::{Context, Result, bail};
@@ -97,6 +98,21 @@ impl RemoteProcess {
         let remote_iov = [RemoteIoVec { base: addr, len: data.len() }];
         process_vm_writev(self.pid, &local_iov, &remote_iov)
             .context("process_vm_writev failed")?;
+        Ok(())
+    }
+
+    /// 通过 /proc/pid/mem 写入远程内存，不受页面权限限制
+    /// ptrace attach 状态下可以写任何地址（包括只读页）
+    pub fn write_mem_io(&self, addr: usize, data: &[u8]) -> Result<()> {
+        let mem_path = format!("/proc/{}/mem", self.pid.as_raw());
+        let mut file = OpenOptions::new()
+            .write(true)
+            .open(&mem_path)
+            .context(format!("Failed to open {mem_path}"))?;
+        file.seek(SeekFrom::Start(addr as u64))
+            .context("Failed to seek /proc/pid/mem")?;
+        file.write_all(data)
+            .context("Failed to write /proc/pid/mem")?;
         Ok(())
     }
 
