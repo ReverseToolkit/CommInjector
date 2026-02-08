@@ -13,8 +13,21 @@ members = [
 [dependencies]
 xdl-rs = { path = "xdl-rs" }
 android-properties = { path = "android-properties" }
-nix = { version = "0.31.1", features = ["signal", "pthread", "ptrace", "inotify", "poll"] }
 anyhow = "1.0.101"
 clap = { version = "4", features = ["derive"] }
 log = "0.4"
 env_logger = "0.11"
+proc-maps = "0.4"
+libc = "1.0.0-alpha.2"
+
+[dependencies.nix]
+version = "0.31.1"
+features = [
+    "signal",
+    "pthread",
+    "ptrace",
+    "inotify",
+    "poll",
+    "uio",
+    "process",
+]

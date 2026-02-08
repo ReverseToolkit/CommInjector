@@ -1,4 +1,6 @@
+mod injector;
 mod proc_monitor;
+mod ptrace_ext;
 
 use std::os::fd::AsFd;
 use std::os::unix::prelude::OsStrExt;
@@ -17,6 +19,10 @@ struct Args {
     /// 目标包名
     #[arg(short, long)]
     package: String,
+
+    /// 要注入的 so 路径
+    #[arg(short, long)]
+    lib: String,
 
     /// 等待进程就绪的超时时间（秒）
     #[arg(short, long, default_value_t = 5)]
@@ -39,7 +45,13 @@ fn main() -> Result<()> {
         info!("Target found: pid={} uid={} name={}", event.pid, event.uid, event.process_name);
 
         match wait_for_proc_ready(event.pid, Duration::from_secs(args.timeout)) {
-            Ok(true) => info!("pid {} ready, inject now!", event.pid),
+            Ok(true) => {
+                info!("pid {} ready, injecting...", event.pid);
+                match injector::inject(event.pid, &args.lib) {
+                    Ok(info) => info!("Injection succeeded! handle={:#x} base={:#x}", info.dl_handle, info.base_addr),
+                    Err(e) => warn!("Injection failed: {e:#}"),
+                }
+            }
             Ok(false) => warn!("pid {} exited or timeout", event.pid),
             Err(e) => warn!("wait_for_proc_ready failed: {e:#}"),
         }
