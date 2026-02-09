@@ -43,6 +43,11 @@ struct Cli {
     #[arg(long = "hider", value_enum)]
     hiders: Vec<HiderKind>,
 
+    /// JNI_OnLoad 验证 key，payload 端可通过 reserved 参数校验
+    /// 支持十六进制（0x1337）或十进制
+    #[arg(long)]
+    jni_key: Option<String>,
+
     #[command(subcommand)]
     method: InjectMethod,
 }
@@ -69,12 +74,27 @@ fn build_hiders(kinds: &[HiderKind]) -> Vec<Box<dyn hider::Hider>> {
         .collect()
 }
 
+fn parse_jni_key(s: &str) -> Result<usize> {
+    let s = s.trim();
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        usize::from_str_radix(hex, 16).context("Invalid hex jni-key")
+    } else {
+        s.parse::<usize>().context("Invalid jni-key")
+    }
+}
+
 fn main() -> Result<()> {
     env_logger::init();
     let cli = Cli::parse();
 
     let use_memfd = matches!(cli.method, InjectMethod::Memfd);
     let hiders = build_hiders(&cli.hiders);
+    let jni_key = cli
+        .jni_key
+        .as_deref()
+        .map(parse_jni_key)
+        .transpose()
+        .context("Failed to parse --jni-key")?;
 
     info!("Waiting for {} to start...", cli.package);
 
@@ -96,7 +116,7 @@ fn main() -> Result<()> {
         match wait_for_proc_ready(event.pid, Duration::from_secs(cli.timeout)) {
             Ok(true) => {
                 info!("pid {} ready, injecting...", event.pid);
-                match injector::inject(event.pid, &cli.lib, use_memfd, &hiders) {
+                match injector::inject(event.pid, &cli.lib, use_memfd, &hiders, jni_key) {
                     Ok(info) => {
                         let hider_summary: String = info
                             .hider_results

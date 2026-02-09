@@ -14,6 +14,7 @@ Android 平台进程注入工具，使用 Rust 编写，通过 NDK 交叉编译�
   - `kernel-maps`：通过 WuWa 内核驱动在 VFS 层完全隐藏 maps 条目
   - `kernel-signal`：通过 WuWa 内核驱动过滤 SIGPROF，防止 profiler 采样泄漏注入库 PC 地址
 - 注入完成后自动调用 `JNI_OnLoad` 并恢复目标进程状态
+- 支持 `--jni-key` 验证机制，防止 payload 被系统或其他加载器误触发
 
 ## 环境要求
 
@@ -45,6 +46,9 @@ injector -p <包名> -l <so路径> \
   --hider kernel-maps --hider kernel-signal \
   --hider maps --hider solist \
   memfd
+
+# 带 JNI_OnLoad key 验证（支持十六进制和十进制）
+injector -p <包名> -l <so路径> --jni-key 0x1337 memfd
 ```
 
 参数说明：
@@ -52,6 +56,7 @@ injector -p <包名> -l <so路径> \
 - `-l`：要注入的 so 文件路径
 - `-t`：等待进程就绪的超时时间（秒，默认 5）
 - `--hider`：启用的隐藏器，可多次指定
+- `--jni-key`：JNI_OnLoad 验证 key，通过 `reserved` 参数传递给 payload，payload 端校验不通过则跳过初始化
 - 子命令 `dlopen` / `memfd`：选择注入方式
 
 ## 项目结构

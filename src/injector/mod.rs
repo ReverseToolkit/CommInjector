@@ -38,7 +38,13 @@ pub trait Injector {
 }
 
 /// 注入 so 到目标进程
-pub fn inject(pid: i32, lib_path: &str, use_memfd: bool, hiders: &[Box<dyn Hider>]) -> Result<InjectedInfo> {
+pub fn inject(
+    pid: i32,
+    lib_path: &str,
+    use_memfd: bool,
+    hiders: &[Box<dyn Hider>],
+    jni_key: Option<usize>,
+) -> Result<InjectedInfo> {
     info!("Injecting {} into pid {}", lib_path, pid);
 
     if !Path::new(lib_path).exists() {
@@ -71,8 +77,9 @@ pub fn inject(pid: i32, lib_path: &str, use_memfd: bool, hiders: &[Box<dyn Hider
         if info.is_valid() {
             match remote_dlsym(&proc, info.dl_handle, "JNI_OnLoad") {
                 Ok(ep) if ep != 0 => {
-                    info!("Calling JNI_OnLoad at {:#x}", ep);
-                    if let Err(e) = proc.call_function(ep, &[]) {
+                    let key = jni_key.unwrap_or(0);
+                    info!("Calling JNI_OnLoad at {:#x} (key={:#x})", ep, key);
+                    if let Err(e) = proc.call_function(ep, &[0, key]) {
                         warn!("JNI_OnLoad call failed: {e:#}");
                     }
                 }

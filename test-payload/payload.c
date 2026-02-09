@@ -263,12 +263,23 @@ static void init(void) {
 }
 
 /// 注入器在 hide_maps 完成后远程调用此函数
+/// reserved 参数用于传递验证 key，防止被系统或其他加载器误触发
+/// 使用方式: injector --jni-key 0x1337 ...
+#define INJECTOR_KEY 0x1337
+
 __attribute__((visibility("default")))
 int JNI_OnLoad(void *vm, void *reserved) {
     (void)vm;
-    (void)reserved;
+
+    if (reserved != (void *)INJECTOR_KEY) {
+        __android_log_print(ANDROID_LOG_WARN, TAG,
+            "JNI_OnLoad: key mismatch (got %p, expected %p), ignoring",
+            reserved, (void *)INJECTOR_KEY);
+        return 0x10006;
+    }
+
     __android_log_print(ANDROID_LOG_INFO, TAG,
-        "JNI_OnLoad called! pid=%d uid=%d", getpid(), getuid());
+        "JNI_OnLoad called by injector! pid=%d uid=%d", getpid(), getuid());
 
     dump_self_maps();
     dump_solist();
