@@ -2,20 +2,128 @@ use crate::ptrace_ext::RemoteProcess;
 use anyhow::{Context, Result, bail};
 use log::debug;
 use proc_maps::get_process_maps;
+use std::fs;
 use std::process;
+
+const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
+const PT_LOAD: u32 = 1;
+const SHT_DYNSYM: u32 = 11;
+const SHT_SYMTAB: u32 = 2;
 
 /// 在远程进程中查找某个 so 的基址
 pub fn find_remote_lib_base(pid: i32, lib_name: &str) -> Result<Option<usize>> {
+    Ok(find_remote_lib(pid, lib_name)?.map(|(base, _)| base))
+}
+
+/// 查找远程 so 的最低映射地址和磁盘路径
+pub fn find_remote_lib(pid: i32, lib_name: &str) -> Result<Option<(usize, String)>> {
     let maps = get_process_maps(pid).context("Failed to read remote maps")?;
+    let mut best: Option<(usize, String)> = None;
     for map in &maps {
         if let Some(path) = map.filename() {
             let path_str = path.to_string_lossy();
             if path_str.contains(lib_name) {
-                return Ok(Some(map.start()));
+                let start = map.start();
+                if best.as_ref().map(|(base, _)| start < *base).unwrap_or(true) {
+                    best = Some((start, path_str.into_owned()));
+                }
             }
         }
     }
-    Ok(None)
+    Ok(best)
+}
+
+/// 解析远程进程已映射库中的导出/调试符号
+pub fn find_remote_export(pid: i32, lib_name: &str, symbol: &str) -> Result<usize> {
+    let (remote_base, path) = find_remote_lib(pid, lib_name)?
+        .with_context(|| format!("{lib_name} not mapped in pid {pid}"))?;
+    let offset = elf64_symbol_offset(&path, symbol)
+        .with_context(|| format!("symbol {symbol} not found in {path}"))?;
+    Ok(remote_base + offset)
+}
+
+fn elf64_symbol_offset(path: &str, symbol: &str) -> Result<usize> {
+    let data = fs::read(path).with_context(|| format!("Failed to read {path}"))?;
+    if data.len() < 64 || data[..4] != ELF_MAGIC {
+        bail!("{path} is not an ELF");
+    }
+    if data[4] != 2 {
+        bail!("Only ELF64 is supported: {path}");
+    }
+
+    let e_phoff = u64::from_le_bytes(data[32..40].try_into().unwrap()) as usize;
+    let e_shoff = u64::from_le_bytes(data[40..48].try_into().unwrap()) as usize;
+    let e_phentsize = u16::from_le_bytes(data[54..56].try_into().unwrap()) as usize;
+    let e_phnum = u16::from_le_bytes(data[56..58].try_into().unwrap()) as usize;
+    let e_shentsize = u16::from_le_bytes(data[58..60].try_into().unwrap()) as usize;
+    let e_shnum = u16::from_le_bytes(data[60..62].try_into().unwrap()) as usize;
+
+    let mut load_vaddr = 0u64;
+    for i in 0..e_phnum {
+        let off = e_phoff + i * e_phentsize;
+        if off + 32 > data.len() {
+            break;
+        }
+        let p_type = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
+        if p_type == PT_LOAD {
+            load_vaddr = u64::from_le_bytes(data[off + 16..off + 24].try_into().unwrap());
+            break;
+        }
+    }
+
+    let mut found = None;
+    for i in 0..e_shnum {
+        let sh = e_shoff + i * e_shentsize;
+        if sh + 40 > data.len() {
+            break;
+        }
+        let sh_type = u32::from_le_bytes(data[sh + 4..sh + 8].try_into().unwrap());
+        if sh_type != SHT_DYNSYM && sh_type != SHT_SYMTAB {
+            continue;
+        }
+        let sym_off = u64::from_le_bytes(data[sh + 24..sh + 32].try_into().unwrap()) as usize;
+        let sym_size = u64::from_le_bytes(data[sh + 32..sh + 40].try_into().unwrap()) as usize;
+        let strtab_idx = u32::from_le_bytes(data[sh + 40..sh + 44].try_into().unwrap()) as usize;
+        let entsize = {
+            let raw = u64::from_le_bytes(data[sh + 56..sh + 64].try_into().unwrap()) as usize;
+            if raw == 0 { 24 } else { raw }
+        };
+        if strtab_idx >= e_shnum {
+            continue;
+        }
+        let str_sh = e_shoff + strtab_idx * e_shentsize;
+        let str_off = u64::from_le_bytes(data[str_sh + 24..str_sh + 32].try_into().unwrap()) as usize;
+        let str_size = u64::from_le_bytes(data[str_sh + 32..str_sh + 40].try_into().unwrap()) as usize;
+        if str_off + str_size > data.len() {
+            continue;
+        }
+        let strtab = &data[str_off..str_off + str_size];
+        let count = if entsize == 0 { 0 } else { sym_size / entsize };
+        for j in 0..count {
+            let off = sym_off + j * entsize;
+            if off + 24 > data.len() {
+                break;
+            }
+            let st_name = u32::from_le_bytes(data[off..off + 4].try_into().unwrap()) as usize;
+            let st_value = u64::from_le_bytes(data[off + 8..off + 16].try_into().unwrap());
+            if st_name == 0 || st_name >= strtab.len() {
+                continue;
+            }
+            let end = strtab[st_name..].iter().position(|&b| b == 0).unwrap_or(0);
+            if let Ok(name) = std::str::from_utf8(&strtab[st_name..st_name + end]) {
+                if name == symbol {
+                    found = Some(st_value);
+                    break;
+                }
+            }
+        }
+        if found.is_some() {
+            break;
+        }
+    }
+
+    let st_value = found.with_context(|| format!("symbol {symbol} not in {path}"))?;
+    Ok(st_value.saturating_sub(load_vaddr) as usize)
 }
 
 /// 在本地进程中查找某个 so 的基址

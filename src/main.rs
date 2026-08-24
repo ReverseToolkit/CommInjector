@@ -4,6 +4,7 @@ mod linker_sym;
 mod proc_monitor;
 mod ptrace_ex;
 mod ptrace_ext;
+mod remote_jni;
 
 use std::os::fd::AsFd;
 use std::os::unix::prelude::OsStrExt;
@@ -29,7 +30,7 @@ struct Cli {
     #[arg(short, long)]
     package: String,
 
-    /// 要注入的 so 路径
+    /// 要注入的 payload 路径（dlopen/memfd 用 .so，dex 用 .dex）
     #[arg(short, long)]
     lib: String,
 
@@ -52,10 +53,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum InjectMethod {
-    /// 使用标准 dlopen 注入
+    /// 使用标准 dlopen 注入 SO
     Dlopen,
-    /// 使用 memfd_create + android_dlopen_ext 注入，绕过路径限制
+    /// 使用 memfd_create + android_dlopen_ext 注入 SO，绕过路径限制
     Memfd,
+    /// 将 DEX 合并进目标进程自己的 ClassLoader（不加载 SO）
+    Dex,
 }
 
 fn build_hiders(kinds: &[HiderKind]) -> Vec<Box<dyn hider::Hider>> {
@@ -83,7 +86,11 @@ fn main() -> Result<()> {
     env_logger::init();
     let cli = Cli::parse();
 
-    let use_memfd = matches!(cli.method, InjectMethod::Memfd);
+    let kind = match cli.method {
+        InjectMethod::Dlopen => injector::InjectKind::So { use_memfd: false },
+        InjectMethod::Memfd => injector::InjectKind::So { use_memfd: true },
+        InjectMethod::Dex => injector::InjectKind::Dex,
+    };
     let hiders = build_hiders(&cli.hiders);
     let jni_key = cli
         .jni_key
@@ -112,7 +119,7 @@ fn main() -> Result<()> {
         match wait_for_proc_ready(event.pid, Duration::from_secs(cli.timeout)) {
             Ok(true) => {
                 info!("pid {} ready, injecting...", event.pid);
-                match injector::inject(event.pid, &cli.lib, use_memfd, &hiders, jni_key) {
+                match injector::inject(event.pid, &cli.lib, kind, &hiders, jni_key) {
                     Ok(info) => {
                         let hider_summary: String = info
                             .hider_results
@@ -120,10 +127,14 @@ fn main() -> Result<()> {
                             .map(|(name, ok)| format!("{name}={ok}"))
                             .collect::<Vec<_>>()
                             .join(" ");
-                        info!(
-                            "Injection succeeded! handle={:#x} base={:#x} {hider_summary}",
-                            info.dl_handle, info.base_addr
-                        );
+                        if info.dl_handle == 0 && info.base_addr != 0 {
+                            info!("DEX injection succeeded, buffer={:#x}", info.base_addr);
+                        } else {
+                            info!(
+                                "Injection succeeded! handle={:#x} base={:#x} {hider_summary}",
+                                info.dl_handle, info.base_addr
+                            );
+                        }
                     },
                     Err(e) => warn!("Injection failed: {e:#}"),
                 }

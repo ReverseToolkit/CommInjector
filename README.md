@@ -5,9 +5,10 @@ Android 平台进程注入工具，使用 Rust 编写，通过 NDK 交叉编译�
 ## 功能
 
 - 监控 Android 进程启动事件（通过读取 `liblog.so` 的 event log，监听 `am_proc_start`）
-- 基于 `ptrace` 的进程注入，支持两种注入方式：
-  - `dlopen`：标准 dlopen 注入
-  - `memfd`：memfd_create + android_dlopen_ext，绕过路径限制
+- 基于 `ptrace` 的进程注入，SO 与 DEX 使用不同子命令：
+  - `dlopen`：标准 dlopen 注入 SO
+  - `memfd`：memfd_create + android_dlopen_ext 注入 SO，绕过路径限制
+  - `dex`：不注入 helper SO，远程 JNI 把 dex 合并进目标进程自己的 `PathClassLoader`
 - 可叠加的注入痕迹隐藏器：
   - `maps`：用户态 remap 匿名映射，隐藏 `/proc/pid/maps` 中的库路径
   - `solist`：调用 linker 内部 `soinfo_unload` 清理 solist / namespace 痕迹（size 置零避免 munmap）
@@ -42,17 +43,24 @@ spec-injector -p <包名> -l <so路径> --hider maps --hider solist dlopen
 # memfd 注入 + maps/solist 隐藏
 spec-injector -p <包名> -l <so路径> --hider maps --hider solist memfd
 
+# DEX：单独子命令，不加载任何 SO，挂到 app 自己的 ClassLoader
+spec-injector -p <包名> -l <dex路径> dex
+
+# 构建并推送测试 DEX（logcat 过滤 SpecDex）
+bash test-dex/build.sh
+spec-injector -p <包名> -l /data/local/tmp/hook.dex dex
+
 # 带 JNI_OnLoad key 验证（支持十六进制和十进制）
 spec-injector -p <包名> -l <so路径> --jni-key 0x1337 memfd
 ```
 
 参数说明：
 - `-p`：目标应用包名
-- `-l`：要注入的 so 文件路径
+- `-l`：要注入的 payload 路径（`dlopen`/`memfd` 用 `.so`，`dex` 用 `.dex`）
 - `-t`：等待进程就绪的超时时间（秒，默认 5）
-- `--hider`：启用的隐藏器，可多次指定
+- `--hider`：启用的隐藏器，可多次指定（仅 SO）
 - `--jni-key`：JNI_OnLoad 验证 key，通过 `reserved` 参数传递给 payload，payload 端校验不通过则跳过初始化
-- 子命令 `dlopen` / `memfd`：选择注入方式
+- 子命令 `dlopen` / `memfd`：注入 SO；`dex`：注入 DEX
 
 ## 项目结构
 
@@ -66,7 +74,9 @@ src/
 ├── injector/
 │   ├── mod.rs           # Injector trait + 注入流程编排
 │   ├── dlopen.rs        # 标准 dlopen 注入
-│   └── memfd.rs         # memfd 注入
+│   ├── memfd.rs         # memfd 注入
+│   └── dex.rs           # DEX → 目标 ClassLoader（远程 JNI + DexPathList）
+├── remote_jni.rs        # 远程 JNIEnv / JavaVM 调用
 └── hider/
     ├── mod.rs           # Hider trait + HideTarget
     ├── maps.rs          # 用户态 maps 隐藏

@@ -1,3 +1,4 @@
+mod dex;
 mod dlopen;
 mod memfd;
 
@@ -37,18 +38,40 @@ pub trait Injector {
     fn load(&self, proc: &RemoteProcess, lib_path: &str) -> Result<LoadResult>;
 }
 
-/// 注入 so 到目标进程
+#[derive(Clone, Copy, Debug)]
+pub enum InjectKind {
+    So { use_memfd: bool },
+    Dex,
+}
+
+/// 注入 payload 到目标进程
 pub fn inject(
     pid: i32,
     lib_path: &str,
-    use_memfd: bool,
+    kind: InjectKind,
     hiders: &[Box<dyn Hider>],
     jni_key: Option<usize>,
 ) -> Result<InjectedInfo> {
     info!("Injecting {} into pid {}", lib_path, pid);
 
     if !Path::new(lib_path).exists() {
-        bail!("Library not found: {lib_path}");
+        bail!("Payload not found: {lib_path}");
+    }
+
+    match kind {
+        InjectKind::Dex => {
+            if !dex::is_dex_payload(lib_path) {
+                bail!("dex subcommand requires a .dex file: {lib_path}");
+            }
+            if !hiders.is_empty() {
+                warn!("hiders apply to injected SOs only and will be skipped for DEX");
+            }
+        }
+        InjectKind::So { .. } => {
+            if dex::is_dex_payload(lib_path) {
+                bail!("DEX payload requires the dex subcommand");
+            }
+        }
     }
 
     let stop_result = kill(Pid::from_raw(pid), Signal::SIGSTOP);
@@ -71,22 +94,18 @@ pub fn inject(
         warn!("Could not find a suitable default_caller, remote calls may fail");
     }
 
-    let result = do_inject(&proc, pid, lib_path, use_memfd, hiders);
-
-    if let Ok(ref info) = result {
-        if info.is_valid() {
-            match remote_dlsym(&proc, info.dl_handle, "JNI_OnLoad") {
-                Ok(ep) if ep != 0 => {
-                    let key = jni_key.unwrap_or(0);
-                    info!("Calling JNI_OnLoad at {:#x} (key={:#x})", ep, key);
-                    if let Err(e) = proc.call_function(ep, &[0, key]) {
-                        warn!("JNI_OnLoad call failed: {e:#}");
-                    }
+    let result = match kind {
+        InjectKind::Dex => dex::inject_dex(&proc, lib_path),
+        InjectKind::So { use_memfd } => {
+            let info = do_inject(&proc, pid, lib_path, use_memfd, hiders);
+            if let Ok(ref injected) = info {
+                if injected.is_valid() {
+                    call_jni_onload(&proc, injected, jni_key);
                 }
-                _ => debug!("No JNI_OnLoad symbol found, skipping"),
             }
+            info
         }
-    }
+    };
 
     proc.detach()?;
     info!("Detached from pid {}", pid);
@@ -97,6 +116,19 @@ pub fn inject(
     }
 
     result
+}
+
+fn call_jni_onload(proc: &RemoteProcess, injected: &InjectedInfo, jni_key: Option<usize>) {
+    match remote_dlsym(proc, injected.dl_handle, "JNI_OnLoad") {
+        Ok(ep) if ep != 0 => {
+            let key = jni_key.unwrap_or(0);
+            info!("Calling JNI_OnLoad at {ep:#x} (key={key:#x})");
+            if let Err(e) = proc.call_function(ep, &[0, key]) {
+                warn!("JNI_OnLoad call failed: {e:#}");
+            }
+        }
+        _ => debug!("No JNI_OnLoad symbol found, skipping"),
+    }
 }
 
 fn do_inject(

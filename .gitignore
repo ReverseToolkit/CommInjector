@@ -12,3 +12,6 @@
 /.claude
 /.trae
 /test-payload/libpayload.so
+/test-dex/out/
+/test-dex/hook.dex
+/test-dex/.r8-*.jar
