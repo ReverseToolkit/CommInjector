@@ -1,5 +1,3 @@
-pub mod kernel_maps;
-pub mod kernel_signal;
 pub mod maps;
 pub mod solist;
 

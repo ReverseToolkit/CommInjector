@@ -1,9 +1,9 @@
 mod hider;
 mod injector;
+mod linker_sym;
 mod proc_monitor;
 mod ptrace_ex;
 mod ptrace_ext;
-pub(crate) mod wuwa;
 
 use std::os::fd::AsFd;
 use std::os::unix::prelude::OsStrExt;
@@ -20,12 +20,10 @@ use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify};
 enum HiderKind {
     Maps,
     Solist,
-    KernelMaps,
-    KernelSignal,
 }
 
 #[derive(Parser)]
-#[command(name = "injector", about = "Android process injector")]
+#[command(name = "spec-injector", about = "SpecInjector — Android process injector")]
 struct Cli {
     /// 目标包名
     #[arg(short, long)]
@@ -67,8 +65,6 @@ fn build_hiders(kinds: &[HiderKind]) -> Vec<Box<dyn hider::Hider>> {
             match k {
                 HiderKind::Maps => Box::new(hider::maps::MapsHider),
                 HiderKind::Solist => Box::new(hider::solist::SolistHider),
-                HiderKind::KernelMaps => Box::new(hider::kernel_maps::KernelMapsHider),
-                HiderKind::KernelSignal => Box::new(hider::kernel_signal::KernelSignalHider),
             }
         })
         .collect()

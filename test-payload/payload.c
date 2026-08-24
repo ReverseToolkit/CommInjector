@@ -264,7 +264,7 @@ static void init(void) {
 
 /// 注入器在 hide_maps 完成后远程调用此函数
 /// reserved 参数用于传递验证 key，防止被系统或其他加载器误触发
-/// 使用方式: injector --jni-key 0x1337 ...
+/// 使用方式: spec-injector --jni-key 0x1337 ...
 #define INJECTOR_KEY 0x1337
 
 __attribute__((visibility("default")))
@@ -279,7 +279,7 @@ int JNI_OnLoad(void *vm, void *reserved) {
     }
 
     __android_log_print(ANDROID_LOG_INFO, TAG,
-        "JNI_OnLoad called by injector! pid=%d uid=%d", getpid(), getuid());
+        "JNI_OnLoad called by spec-injector! pid=%d uid=%d", getpid(), getuid());
 
     dump_self_maps();
     dump_solist();

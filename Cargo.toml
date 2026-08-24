@@ -1,8 +1,12 @@
 [package]
-name = "injector"
+name = "spec-injector"
 version = "0.1.0"
 edition = "2024"
 authors = ["fuqiuluo"]
+
+[[bin]]
+name = "spec-injector"
+path = "src/main.rs"
 
 [workspace]
 members = [
@@ -22,4 +26,4 @@ libc = "1.0.0-alpha.2"
 
 [dependencies.nix]
 version = "0.31.1"
-features = ["signal", "pthread", "ptrace", "inotify", "poll", "uio", "process", "mman", "socket"]
+features = ["signal", "pthread", "ptrace", "inotify", "poll", "uio", "process", "mman"]

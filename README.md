@@ -1,6 +1,6 @@
-# Injector
+# SpecInjector
 
-Android 平台进程注入工具，使用 Rust 编写，通过 NDK 交叉编译。
+Android 平台进程注入工具，使用 Rust 编写，通过 NDK 交叉编译。Fork 自 [WuwaInjector](https://github.com/y0xc/WuwaInjector)。
 
 ## 功能
 
@@ -10,9 +10,7 @@ Android 平台进程注入工具，使用 Rust 编写，通过 NDK 交叉编译�
   - `memfd`：memfd_create + android_dlopen_ext，绕过路径限制
 - 可叠加的注入痕迹隐藏器：
   - `maps`：用户态 remap 匿名映射，隐藏 `/proc/pid/maps` 中的库路径
-  - `solist`：修改 linker soinfo 链表，从动态链接器中 unlink 目标库
-  - `kernel-maps`：通过 WuWa 内核驱动在 VFS 层完全隐藏 maps 条目
-  - `kernel-signal`：通过 WuWa 内核驱动过滤 SIGPROF，防止 profiler 采样泄漏注入库 PC 地址
+  - `solist`：调用 linker 内部 `soinfo_unload` 清理 solist / namespace 痕迹（size 置零避免 munmap）
 - 注入完成后自动调用 `JNI_OnLoad` 并恢复目标进程状态
 - 支持 `--jni-key` 验证机制，防止 payload 被系统或其他加载器误触发
 
@@ -39,16 +37,13 @@ cargo build --target aarch64-linux-android --release
 
 ```bash
 # dlopen 注入 + maps/solist 隐藏
-injector -p <包名> -l <so路径> --hider maps --hider solist dlopen
+spec-injector -p <包名> -l <so路径> --hider maps --hider solist dlopen
 
-# memfd 注入 + 全部隐藏器
-injector -p <包名> -l <so路径> \
-  --hider kernel-maps --hider kernel-signal \
-  --hider maps --hider solist \
-  memfd
+# memfd 注入 + maps/solist 隐藏
+spec-injector -p <包名> -l <so路径> --hider maps --hider solist memfd
 
 # 带 JNI_OnLoad key 验证（支持十六进制和十进制）
-injector -p <包名> -l <so路径> --jni-key 0x1337 memfd
+spec-injector -p <包名> -l <so路径> --jni-key 0x1337 memfd
 ```
 
 参数说明：
@@ -67,7 +62,7 @@ src/
 ├── proc_monitor.rs      # 进程启动监控
 ├── ptrace_ext.rs        # ptrace 底层封装
 ├── ptrace_ex.rs         # ptrace 扩展操作（远程 mmap/dlsym 等）
-├── wuwa.rs              # WuWa 内核驱动 SDK
+├── linker_sym.rs        # linker 内部符号解析
 ├── injector/
 │   ├── mod.rs           # Injector trait + 注入流程编排
 │   ├── dlopen.rs        # 标准 dlopen 注入
@@ -75,9 +70,7 @@ src/
 └── hider/
     ├── mod.rs           # Hider trait + HideTarget
     ├── maps.rs          # 用户态 maps 隐藏
-    ├── solist.rs        # soinfo 链表隐藏
-    ├── kernel_maps.rs   # 内核层 maps 过滤
-    └── kernel_signal.rs # 内核层 SIGPROF 过滤
+    └── solist.rs        # soinfo_unload 清理 solist
 ```
 
 ## 致谢
@@ -88,7 +81,6 @@ src/
 - [AndKittyInjector](https://github.com/MJx0/AndKittyInjector) — soinfo 动态探测技术参考
 - [fake-linker](https://github.com/sanfengAndroid/fake-linker) — soinfo 硬编码偏移参考（各 Android 版本）
 - [Riru](https://github.com/RikkaApps/Riru) — maps 隐藏（remap 匿名映射）技术参考
-- [android-wuwa](https://github.com/fuqiuluo/android-wuwa) — WuWa 内核驱动，提供内核层 maps/signal 过滤能力
 - [fadeevab](https://fadeevab.com/shared-library-injection-on-android-8/) — default_caller / LR 远程函数调用技术参考
 
 ## License
