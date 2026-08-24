@@ -123,7 +123,7 @@ fn main() -> Result<()> {
         match wait_for_proc_ready(event.pid, Duration::from_secs(cli.timeout)) {
             Ok(true) => {
                 info!("pid {} ready, injecting...", event.pid);
-                match injector::inject(event.pid, &cli.lib, kind, &hiders, jni_key) {
+                match injector::inject(event.pid, &cli.lib, kind.clone(), &hiders, jni_key) {
                     Ok(info) => {
                         let hider_summary: String = info
                             .hider_results
