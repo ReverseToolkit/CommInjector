@@ -43,12 +43,12 @@ spec-injector -p <包名> -l <so路径> --hider maps --hider solist dlopen
 # memfd 注入 + maps/solist 隐藏
 spec-injector -p <包名> -l <so路径> --hider maps --hider solist memfd
 
-# DEX：单独子命令，不加载任何 SO，挂到 app 自己的 ClassLoader
-spec-injector -p <包名> -l <dex路径> dex
+# DEX：单独子命令，合并进 app ClassLoader 后主动调用静态方法
+spec-injector -p <包名> -l <dex路径> dex -e spec.inject.HookEntry.init
 
 # 构建并推送测试 DEX（logcat 过滤 SpecDex）
 bash test-dex/build.sh
-spec-injector -p <包名> -l /data/local/tmp/hook.dex dex
+spec-injector -p <包名> -l /data/local/tmp/hook.dex dex -e spec.inject.HookEntry.init
 
 # 带 JNI_OnLoad key 验证（支持十六进制和十进制）
 spec-injector -p <包名> -l <so路径> --jni-key 0x1337 memfd
@@ -61,6 +61,7 @@ spec-injector -p <包名> -l <so路径> --jni-key 0x1337 memfd
 - `--hider`：启用的隐藏器，可多次指定（仅 SO）
 - `--jni-key`：JNI_OnLoad 验证 key，通过 `reserved` 参数传递给 payload，payload 端校验不通过则跳过初始化
 - 子命令 `dlopen` / `memfd`：注入 SO；`dex`：注入 DEX
+- `dex -e/--entry`：注入后主动调用的静态方法，格式 `Class.method`、`Class#method` 或 `Class::method`，签名必须是 `()V`
 
 ## 项目结构
 

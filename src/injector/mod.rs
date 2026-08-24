@@ -38,10 +38,10 @@ pub trait Injector {
     fn load(&self, proc: &RemoteProcess, lib_path: &str) -> Result<LoadResult>;
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub enum InjectKind {
     So { use_memfd: bool },
-    Dex,
+    Dex { entry: String },
 }
 
 /// 注入 payload 到目标进程
@@ -59,7 +59,7 @@ pub fn inject(
     }
 
     match kind {
-        InjectKind::Dex => {
+        InjectKind::Dex { .. } => {
             if !dex::is_dex_payload(lib_path) {
                 bail!("dex subcommand requires a .dex file: {lib_path}");
             }
@@ -95,7 +95,7 @@ pub fn inject(
     }
 
     let result = match kind {
-        InjectKind::Dex => dex::inject_dex(&proc, lib_path),
+        InjectKind::Dex { ref entry } => dex::inject_dex(&proc, lib_path, entry),
         InjectKind::So { use_memfd } => {
             let info = do_inject(&proc, pid, lib_path, use_memfd, hiders);
             if let Ok(ref injected) = info {

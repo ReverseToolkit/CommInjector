@@ -16,6 +16,10 @@ public final class HookEntry {
         }
     }
 
+    public static void init() {
+        log("HookEntry.init() invoked cl=" + name(HookEntry.class.getClassLoader()));
+    }
+
     private static String name(ClassLoader loader) {
         return loader == null ? "null" : loader.getClass().getName() + "@" + Integer.toHexString(System.identityHashCode(loader));
     }

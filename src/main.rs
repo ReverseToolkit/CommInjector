@@ -58,7 +58,11 @@ enum InjectMethod {
     /// 使用 memfd_create + android_dlopen_ext 注入 SO，绕过路径限制
     Memfd,
     /// 将 DEX 合并进目标进程自己的 ClassLoader（不加载 SO）
-    Dex,
+    Dex {
+        /// 注入后主动调用的静态方法，格式 Class.method 或 Class#method
+        #[arg(short = 'e', long = "entry")]
+        entry: String,
+    },
 }
 
 fn build_hiders(kinds: &[HiderKind]) -> Vec<Box<dyn hider::Hider>> {
@@ -89,7 +93,7 @@ fn main() -> Result<()> {
     let kind = match cli.method {
         InjectMethod::Dlopen => injector::InjectKind::So { use_memfd: false },
         InjectMethod::Memfd => injector::InjectKind::So { use_memfd: true },
-        InjectMethod::Dex => injector::InjectKind::Dex,
+        InjectMethod::Dex { entry } => injector::InjectKind::Dex { entry },
     };
     let hiders = build_hiders(&cli.hiders);
     let jni_key = cli

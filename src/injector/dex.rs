@@ -18,18 +18,19 @@ pub fn is_dex_payload(path: &str) -> bool {
         .is_some_and(|data| data.len() >= 8 && &data[0..4] == b"dex\n")
 }
 
-pub fn inject_dex(proc: &RemoteProcess, dex_path: &str) -> Result<InjectedInfo> {
+pub fn inject_dex(proc: &RemoteProcess, dex_path: &str, entry: &str) -> Result<InjectedInfo> {
+    let (entry_class, entry_method) = parse_entry(entry)?;
     let dex_data = fs::read(dex_path).with_context(|| format!("Failed to read dex: {dex_path}"))?;
     if dex_data.len() < 0x70 || &dex_data[0..4] != b"dex\n" {
         bail!("Invalid dex file: {dex_path}");
     }
 
-    let class_names = dex_class_names(&dex_data);
     info!(
-        "DEX payload {} ({} bytes, {} classes)",
+        "DEX payload {} ({} bytes), entry={}.{}()",
         dex_path,
         dex_data.len(),
-        class_names.len()
+        entry_class,
+        entry_method
     );
 
     let remote_dex = remote_mmap(proc, dex_data.len())?;
@@ -47,8 +48,7 @@ pub fn inject_dex(proc: &RemoteProcess, dex_path: &str) -> Result<InjectedInfo> 
         let added = make_dex_elements(&jni, buffer, loader)?;
         merge_dex_elements(&jni, loader, added)?;
 
-        let loaded = load_dex_classes(&jni, loader, &class_names)?;
-        info!("loaded {loaded} classes into the app ClassLoader");
+        invoke_entry(&jni, loader, &entry_class, &entry_method)?;
         Ok(())
     })();
 
@@ -250,99 +250,45 @@ fn dex_elements_of(jni: &RemoteJni, path_list: usize) -> Result<usize> {
     Ok(elements)
 }
 
-fn load_dex_classes(jni: &RemoteJni, loader: usize, names: &[String]) -> Result<usize> {
+fn parse_entry(entry: &str) -> Result<(String, String)> {
+    let entry = entry.trim();
+    if let Some((class, method)) = entry.split_once('#') {
+        return require_entry(class, method);
+    }
+    if let Some((class, method)) = entry.split_once("::") {
+        return require_entry(class, method);
+    }
+    if let Some((class, method)) = entry.rsplit_once('.') {
+        return require_entry(class, method);
+    }
+    bail!("entry must be Class.method, Class#method, or Class::method");
+}
+
+fn require_entry(class: &str, method: &str) -> Result<(String, String)> {
+    if class.is_empty() || method.is_empty() {
+        bail!("entry must be Class.method, Class#method, or Class::method");
+    }
+    if method.contains('.') || method.contains('#') {
+        bail!("entry method must be a simple name: {method}");
+    }
+    Ok((class.replace('/', "."), method.to_string()))
+}
+
+fn invoke_entry(jni: &RemoteJni, loader: usize, class_name: &str, method: &str) -> Result<()> {
     let class_clz = jni.find_class("java/lang/Class")?;
     let for_name = jni.get_static_method_id(
         class_clz,
         "forName",
         "(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;",
     )?;
+    let jname = jni.new_string_utf(class_name)?;
+    let klass = jni.call_static_object(class_clz, for_name, &[jname, 1, loader])?;
+    if klass == 0 {
+        bail!("Class.forName({class_name}) returned null");
+    }
 
-    let mut loaded = 0usize;
-    for name in names {
-        let jname = match jni.new_string_utf(name) {
-            Ok(v) => v,
-            Err(e) => {
-                warn!("NewStringUTF({name}) failed: {e:#}");
-                continue;
-            }
-        };
-        match jni.call_static_object(class_clz, for_name, &[jname, 1, loader]) {
-            Ok(klass) if klass != 0 => {
-                debug!("loaded class {name}");
-                loaded += 1;
-            }
-            Ok(_) => warn!("Class.forName({name}) returned null"),
-            Err(e) => warn!("Class.forName({name}) failed: {e:#}"),
-        }
-    }
-    Ok(loaded)
-}
-
-fn dex_class_names(dex: &[u8]) -> Vec<String> {
-    if dex.len() < 0x70 {
-        return Vec::new();
-    }
-    let string_ids_off = u32::from_le_bytes(dex[0x24..0x28].try_into().unwrap()) as usize;
-    let type_ids_off = u32::from_le_bytes(dex[0x2c..0x30].try_into().unwrap()) as usize;
-    let class_defs_size = u32::from_le_bytes(dex[0x38..0x3c].try_into().unwrap()) as usize;
-    let class_defs_off = u32::from_le_bytes(dex[0x3c..0x40].try_into().unwrap()) as usize;
-
-    let mut names = Vec::new();
-    for i in 0..class_defs_size {
-        let item = class_defs_off + i * 32;
-        if item + 4 > dex.len() || type_ids_off + 4 > dex.len() {
-            break;
-        }
-        let class_idx = u32::from_le_bytes(dex[item..item + 4].try_into().unwrap()) as usize;
-        let type_off = type_ids_off + class_idx * 4;
-        if type_off + 4 > dex.len() {
-            continue;
-        }
-        let descriptor_idx = u32::from_le_bytes(dex[type_off..type_off + 4].try_into().unwrap()) as usize;
-        if let Some(desc) = dex_string(dex, string_ids_off, descriptor_idx) {
-            if let Some(name) = descriptor_to_name(desc) {
-                names.push(name);
-            }
-        }
-    }
-    names
-}
-
-fn dex_string(dex: &[u8], string_ids_off: usize, idx: usize) -> Option<&str> {
-    let id_off = string_ids_off + idx * 4;
-    if id_off + 4 > dex.len() {
-        return None;
-    }
-    let data_off = u32::from_le_bytes(dex[id_off..id_off + 4].try_into().unwrap()) as usize;
-    if data_off >= dex.len() {
-        return None;
-    }
-    let (utf16_size, hdr) = read_uleb128(&dex[data_off..])?;
-    let start = data_off + hdr;
-    if utf16_size == 0 || start >= dex.len() {
-        return None;
-    }
-    let end = dex[start..].iter().position(|&b| b == 0).unwrap_or(0);
-    std::str::from_utf8(&dex[start..start + end]).ok()
-}
-
-fn read_uleb128(data: &[u8]) -> Option<(u32, usize)> {
-    let mut value = 0u32;
-    let mut shift = 0;
-    for (i, b) in data.iter().enumerate().take(5) {
-        value |= u32::from(b & 0x7f) << shift;
-        if b & 0x80 == 0 {
-            return Some((value, i + 1));
-        }
-        shift += 7;
-    }
-    None
-}
-
-fn descriptor_to_name(descriptor: &str) -> Option<String> {
-    if !descriptor.starts_with('L') || !descriptor.ends_with(';') || descriptor.len() < 3 {
-        return None;
-    }
-    Some(descriptor[1..descriptor.len() - 1].replace('/', "."))
+    let mid = jni.get_static_method_id(klass, method, "()V")?;
+    jni.call_static_void(klass, mid, &[])?;
+    info!("invoked {class_name}.{method}()");
+    Ok(())
 }
