@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install host libclang
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev
+
+      - name: Setup Android NDK
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r29
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build comm-injector
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+          ANDROID_NDK_PATH: ${{ steps.ndk.outputs.ndk-path }}
+          ANDROID_API_LEVEL: "29"
+        run: |
+          set -euo pipefail
+          LLVM_BIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          export CC_aarch64_linux_android="$LLVM_BIN/aarch64-linux-android29-clang"
+          export AR_aarch64_linux_android="$LLVM_BIN/llvm-ar"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$LLVM_BIN/aarch64-linux-android29-clang"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_AR="$LLVM_BIN/llvm-ar"
+          cargo build --release --target aarch64-linux-android
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: comm-injector-aarch64
+          path: target/aarch64-linux-android/release/comm-injector
+          if-no-files-found: error
+
+      - name: Publish GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: target/aarch64-linux-android/release/comm-injector
+          generate_release_notes: true
+          fail_on_unmatched_files: true
