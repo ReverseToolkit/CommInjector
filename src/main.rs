@@ -24,7 +24,7 @@ enum HiderKind {
 }
 
 #[derive(Parser)]
-#[command(name = "spec-injector", about = "SpecInjector — Android process injector")]
+#[command(name = "comm-injector", about = "CommInjector — Android process injector")]
 struct Cli {
     /// 目标包名
     #[arg(short, long)]

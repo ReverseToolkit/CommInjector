@@ -1,4 +1,4 @@
-package spec.inject;
+package comm.inject;
 
 public final class HookEntry {
     static {
@@ -36,9 +36,9 @@ public final class HookEntry {
     private static void log(String msg) {
         try {
             Class<?> log = Class.forName("android.util.Log");
-            log.getMethod("i", String.class, String.class).invoke(null, "SpecDex", msg);
+            log.getMethod("i", String.class, String.class).invoke(null, "CommDex", msg);
         } catch (Throwable ignored) {
-            System.out.println("SpecDex: " + msg);
+            System.out.println("CommDex: " + msg);
         }
     }
 }

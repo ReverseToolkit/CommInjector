@@ -1,11 +1,11 @@
 [package]
-name = "spec-injector"
+name = "comm-injector"
 version = "0.1.0"
 edition = "2024"
 authors = ["fuqiuluo"]
 
 [[bin]]
-name = "spec-injector"
+name = "comm-injector"
 path = "src/main.rs"
 
 [workspace]

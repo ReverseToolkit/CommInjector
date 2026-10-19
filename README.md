@@ -1,4 +1,4 @@
-# SpecInjector
+# CommInjector
 
 Android 平台进程注入工具，使用 Rust 编写，通过 NDK 交叉编译。Fork 自 [WuwaInjector](https://github.com/y0xc/WuwaInjector)。
 
@@ -38,20 +38,20 @@ cargo build --target aarch64-linux-android --release
 
 ```bash
 # dlopen 注入 + maps/solist 隐藏
-spec-injector -p <包名> -l <so路径> --hider maps --hider solist dlopen
+comm-injector -p <包名> -l <so路径> --hider maps --hider solist dlopen
 
 # memfd 注入 + maps/solist 隐藏
-spec-injector -p <包名> -l <so路径> --hider maps --hider solist memfd
+comm-injector -p <包名> -l <so路径> --hider maps --hider solist memfd
 
 # DEX：单独子命令，合并进 app ClassLoader 后主动调用静态方法
-spec-injector -p <包名> -l <dex路径> dex -e spec.inject.HookEntry.init
+comm-injector -p <包名> -l <dex路径> dex -e comm.inject.HookEntry.init
 
-# 构建并推送测试 DEX（logcat 过滤 SpecDex）
+# 构建并推送测试 DEX（logcat 过滤 CommDex）
 bash test-dex/build.sh
-spec-injector -p <包名> -l /data/local/tmp/hook.dex dex -e spec.inject.HookEntry.init
+comm-injector -p <包名> -l /data/local/tmp/hook.dex dex -e comm.inject.HookEntry.init
 
 # 带 JNI_OnLoad key 验证（支持十六进制和十进制）
-spec-injector -p <包名> -l <so路径> --jni-key 0x1337 memfd
+comm-injector -p <包名> -l <so路径> --jni-key 0x1337 memfd
 ```
 
 参数说明：

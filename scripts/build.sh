@@ -37,19 +37,19 @@ echo "Android NDK environment set up for Rust"
 export ANDROID_API_LEVEL=29
 export RUSTFLAGS="-C link-arg=-fuse-ld=mold -C target-feature=+neon"
 
-rm target/aarch64-linux-android/release/spec-injector
-#rm target/armv7-linux-androideabi/release/spec-injector
-#rm target/i686-linux-android/release/spec-injector
-#rm target/x86_64-linux-android/release/spec-injector
+rm target/aarch64-linux-android/release/comm-injector
+#rm target/armv7-linux-androideabi/release/comm-injector
+#rm target/i686-linux-android/release/comm-injector
+#rm target/x86_64-linux-android/release/comm-injector
 
 cargo build --target aarch64-linux-android --release
 #cargo build --target armv7-linux-androideabi --release
 #cargo build --target i686-linux-android --release
 #cargo build --target x86_64-linux-android --release
 
-adb shell su -c "rm /data/adb/spec-injector"
-adb push target/aarch64-linux-android/release/spec-injector /data/local/tmp
-adb shell su -c "mv /data/local/tmp/spec-injector /data/adb/spec-injector"
-adb shell su -c "chmod 755 /data/adb/spec-injector"
-adb shell su -c "kill -9 \$(pidof spec-injector)"
-adb shell su -c "RUST_LOG=debug /data/adb/spec-injector -p moe.fuqiuluo.mamu -l /data/local/tmp/libpayload.so --hider maps --hider solist memfd"
+adb shell su -c "rm /data/adb/comm-injector"
+adb push target/aarch64-linux-android/release/comm-injector /data/local/tmp
+adb shell su -c "mv /data/local/tmp/comm-injector /data/adb/comm-injector"
+adb shell su -c "chmod 755 /data/adb/comm-injector"
+adb shell su -c "kill -9 \$(pidof comm-injector)"
+adb shell su -c "RUST_LOG=debug /data/adb/comm-injector -p moe.fuqiuluo.mamu -l /data/local/tmp/libpayload.so --hider maps --hider solist memfd"

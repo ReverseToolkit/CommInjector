@@ -22,7 +22,7 @@ javac --release 11 -d "$OUT" "$ROOT/HookEntry.java"
 
 if [[ -n "$D8_BIN" ]]; then
     echo "d8 via $D8_BIN"
-    "$D8_BIN" --min-api 29 --output "$OUT" "$OUT/spec/inject/HookEntry.class"
+    "$D8_BIN" --min-api 29 --output "$OUT" "$OUT/comm/inject/HookEntry.class"
 else
     if [[ ! -f "$R8_JAR" ]]; then
         echo "downloading r8 $R8_VER"
@@ -32,7 +32,7 @@ else
     java -cp "$R8_JAR" com.android.tools.r8.D8 \
         --min-api 29 \
         --output "$OUT" \
-        "$OUT/spec/inject/HookEntry.class"
+        "$OUT/comm/inject/HookEntry.class"
 fi
 
 if [[ -f "$OUT/classes.dex" ]]; then
