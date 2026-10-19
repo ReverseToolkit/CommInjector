@@ -24,6 +24,8 @@ impl Injector for MemfdInjector {
             base_addr,
             maps_search_name: search,
             memfd_fd: Some(memfd),
+            jni_onload: None,
+            prot_hide: false,
         })
     }
 }

@@ -33,6 +33,8 @@ impl Injector for DlopenInjector {
             base_addr,
             maps_search_name: search_name,
             memfd_fd: None,
+            jni_onload: None,
+            prot_hide: false,
         })
     }
 }

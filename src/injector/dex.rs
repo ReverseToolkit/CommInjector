@@ -1,8 +1,11 @@
+use crate::prot_hide::{self, PROT_HIDE};
 use crate::ptrace_ex::{remote_mmap, remote_munmap};
 use crate::ptrace_ext::RemoteProcess;
 use crate::remote_jni::RemoteJni;
 use anyhow::{Context, Result, bail};
 use log::{debug, info, warn};
+use proc_maps::get_process_maps;
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
@@ -33,6 +36,7 @@ pub fn inject_dex(proc: &RemoteProcess, dex_path: &str, entry: &str) -> Result<I
         entry_method
     );
 
+    let before = map_starts(proc.pid.as_raw());
     let remote_dex = remote_mmap(proc, dex_data.len())?;
     proc.write_mem(remote_dex, &dex_data)?;
     debug!("dex bytes at {remote_dex:#x}");
@@ -57,11 +61,82 @@ pub fn inject_dex(proc: &RemoteProcess, dex_path: &str, entry: &str) -> Result<I
         return Err(e);
     }
 
+    let hidden = match hide_dex_mappings(&proc, remote_dex, dex_data.len(), &before) {
+        Ok(hidden) => hidden,
+        Err(err) => {
+            warn!("PROT_HIDE on dex mappings failed: {err:#}");
+            false
+        }
+    };
+
     Ok(InjectedInfo {
         dl_handle: 0,
         base_addr: remote_dex,
-        hider_results: Vec::new(),
+        hider_results: vec![("prot_hide".to_string(), hidden)],
+        jni_onload: None,
+        custom_link: false,
     })
+}
+
+fn hide_dex_mappings(proc: &RemoteProcess, buffer: usize, size: usize, before: &HashSet<usize>) -> Result<bool> {
+    let page = page_size();
+    let start = align_down(buffer, page);
+    let end = align_up(buffer + size, page);
+    let mut hidden = prot_hide::remote_mprotect(proc, start, end - start, libc::PROT_READ | PROT_HIDE)?;
+
+    let maps = get_process_maps(proc.pid.as_raw()).context("Failed to read maps after dex load")?;
+    for map in &maps {
+        if before.contains(&map.start()) || map.start() == start {
+            continue;
+        }
+        if !is_anonymous_dex_map(map.filename().map(|p| p.to_string_lossy().into_owned())) {
+            continue;
+        }
+        if map.size() < 4 || !map.is_read() {
+            continue;
+        }
+        let magic = proc.read_mem(map.start(), 4).unwrap_or_default();
+        if magic != b"dex\n" {
+            continue;
+        }
+        let mut prot = libc::PROT_READ;
+        if map.is_write() {
+            prot |= libc::PROT_WRITE;
+        }
+        if map.is_exec() {
+            prot |= libc::PROT_EXEC;
+        }
+        info!("PROT_HIDE dex mapping {:#x} ({} bytes)", map.start(), map.size());
+        hidden &= prot_hide::remote_mprotect(proc, map.start(), map.size(), prot | PROT_HIDE)?;
+    }
+    Ok(hidden)
+}
+
+fn is_anonymous_dex_map(path: Option<String>) -> bool {
+    let Some(path) = path else {
+        return true;
+    };
+    path.is_empty() || path.contains("memfd") || path.contains("dalvik")
+}
+
+fn map_starts(pid: i32) -> HashSet<usize> {
+    get_process_maps(pid)
+        .map(|maps| maps.iter().map(|map| map.start()).collect())
+        .unwrap_or_default()
+}
+
+fn page_size() -> usize {
+    // SAFETY: sysconf(_SC_PAGESIZE) 没有前置条件，失败时返回 -1。
+    let n = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if n <= 0 { 4096 } else { n as usize }
+}
+
+fn align_down(value: usize, page: usize) -> usize {
+    value & !(page - 1)
+}
+
+fn align_up(value: usize, page: usize) -> usize {
+    align_down(value + page - 1, page)
 }
 
 fn app_class_loader(jni: &RemoteJni) -> Result<usize> {

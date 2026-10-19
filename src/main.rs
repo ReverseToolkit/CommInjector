@@ -1,7 +1,9 @@
+mod elf_image;
 mod hider;
 mod injector;
 mod linker_sym;
 mod proc_monitor;
+mod prot_hide;
 mod ptrace_ex;
 mod ptrace_ext;
 mod remote_jni;
@@ -57,6 +59,8 @@ enum InjectMethod {
     Dlopen,
     /// 使用 memfd_create + android_dlopen_ext 注入 SO，绕过路径限制
     Memfd,
+    /// 用自带 linker 装载 SO。映射带 PROT_HIDE，不进入系统 soinfo
+    Linker,
     /// 将 DEX 合并进目标进程自己的 ClassLoader（不加载 SO）
     Dex {
         /// 注入后主动调用的静态方法，格式 Class.method 或 Class#method
@@ -93,6 +97,7 @@ fn main() -> Result<()> {
     let kind = match cli.method {
         InjectMethod::Dlopen => injector::InjectKind::So { use_memfd: false },
         InjectMethod::Memfd => injector::InjectKind::So { use_memfd: true },
+        InjectMethod::Linker => injector::InjectKind::Linker,
         InjectMethod::Dex { entry } => injector::InjectKind::Dex { entry },
     };
     let hiders = build_hiders(&cli.hiders);
@@ -132,7 +137,7 @@ fn main() -> Result<()> {
                             .collect::<Vec<_>>()
                             .join(" ");
                         if info.dl_handle == 0 && info.base_addr != 0 {
-                            info!("DEX injection succeeded, buffer={:#x}", info.base_addr);
+                            info!("DEX injection succeeded, buffer={:#x} {hider_summary}", info.base_addr);
                         } else {
                             info!(
                                 "Injection succeeded! handle={:#x} base={:#x} {hider_summary}",
