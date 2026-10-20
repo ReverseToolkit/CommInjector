@@ -1,4 +1,4 @@
-use crate::prot_hide::{self, PROT_HIDE};
+use crate::prot_hide;
 use crate::ptrace_ex::{remote_mmap, remote_munmap};
 use crate::ptrace_ext::RemoteProcess;
 use crate::remote_jni::RemoteJni;
@@ -10,6 +10,7 @@ use std::fs;
 use std::path::Path;
 
 use super::InjectedInfo;
+use crate::hider::{HideTarget, Hider, LibSegment};
 
 pub fn is_dex_payload(path: &str) -> bool {
     let path = Path::new(path);
@@ -21,7 +22,14 @@ pub fn is_dex_payload(path: &str) -> bool {
         .is_some_and(|data| data.len() >= 8 && &data[0..4] == b"dex\n")
 }
 
-pub fn inject_dex(proc: &RemoteProcess, dex_path: &str, entry: &str) -> Result<InjectedInfo> {
+pub fn inject_dex(
+    proc: &RemoteProcess,
+    pid: i32,
+    dex_path: &str,
+    entry: &str,
+    hiders: &[Box<dyn Hider>],
+    kernel_hide: bool,
+) -> Result<InjectedInfo> {
     let (entry_class, entry_method) = parse_entry(entry)?;
     let dex_data = fs::read(dex_path).with_context(|| format!("Failed to read dex: {dex_path}"))?;
     if dex_data.len() < 0x70 || &dex_data[0..4] != b"dex\n" {
@@ -61,62 +69,118 @@ pub fn inject_dex(proc: &RemoteProcess, dex_path: &str, entry: &str) -> Result<I
         return Err(e);
     }
 
-    let hidden = match hide_dex_mappings(&proc, remote_dex, dex_data.len(), &before) {
-        Ok(hidden) => hidden,
-        Err(err) => {
-            warn!("PROT_HIDE on dex mappings failed: {err:#}");
-            false
+    let segments = dex_segments(proc, remote_dex, dex_data.len(), &before);
+    let mut hider_results = Vec::new();
+    for hider in hiders {
+        let name = hider.name().to_string();
+        if name == "solist" {
+            warn!("solist hider does not apply: dex load has no system soinfo");
+            hider_results.push((name, false));
+            continue;
         }
-    };
+        let target = HideTarget::from_segments(proc, pid, remote_dex, "", segments.clone());
+        match hider.apply(&target) {
+            Ok(true) => {
+                info!("{name}: succeeded");
+                hider_results.push((name, true));
+            }
+            Ok(false) => {
+                warn!("{name}: failed");
+                hider_results.push((name, false));
+            }
+            Err(err) => {
+                warn!("{name} error: {err:#}");
+                hider_results.push((name, false));
+            }
+        }
+    }
+    if kernel_hide {
+        let hidden = match kernel_hide_dex(proc, &segments) {
+            Ok(hidden) => hidden,
+            Err(err) => {
+                warn!("kernel hide on dex mappings failed: {err:#}");
+                false
+            }
+        };
+        hider_results.push(("kernel".to_string(), hidden));
+    }
 
     Ok(InjectedInfo {
         dl_handle: 0,
         base_addr: remote_dex,
-        hider_results: vec![("prot_hide".to_string(), hidden)],
+        hider_results,
         jni_onload: None,
         custom_link: false,
     })
 }
 
-fn hide_dex_mappings(proc: &RemoteProcess, buffer: usize, size: usize, before: &HashSet<usize>) -> Result<bool> {
+fn dex_segments(proc: &RemoteProcess, buffer: usize, size: usize, before: &HashSet<usize>) -> Vec<LibSegment> {
     let page = page_size();
     let start = align_down(buffer, page);
     let end = align_up(buffer + size, page);
-    let mut hidden = prot_hide::remote_mprotect(proc, start, end - start, libc::PROT_READ | PROT_HIDE)?;
-
-    let maps = get_process_maps(proc.pid.as_raw()).context("Failed to read maps after dex load")?;
+    let Ok(maps) = get_process_maps(proc.pid.as_raw()) else {
+        return vec![LibSegment {
+            start,
+            size: end - start,
+            prot: libc::PROT_READ | libc::PROT_WRITE,
+        }];
+    };
+    let mut segments = Vec::new();
     for map in &maps {
-        if before.contains(&map.start()) || map.start() == start {
+        let path = map.filename().map(|p| p.to_string_lossy().into_owned());
+        let covers_buffer = map.start() <= start && map.start() + map.size() > start && map.start() < end;
+        let fresh = !before.contains(&map.start());
+        let magic = if fresh && map.is_read() && map.size() >= 4 {
+            proc.read_mem(map.start(), 4).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let named = path.as_deref().is_some_and(|p| {
+            p.contains("memfd") || p.contains("dalvik") || p.contains(".dex")
+        });
+        if !(covers_buffer || (fresh && (magic == b"dex\n" || named))) {
             continue;
         }
-        if !is_anonymous_dex_map(map.filename().map(|p| p.to_string_lossy().into_owned())) {
-            continue;
-        }
-        if map.size() < 4 || !map.is_read() {
-            continue;
-        }
-        let magic = proc.read_mem(map.start(), 4).unwrap_or_default();
-        if magic != b"dex\n" {
-            continue;
-        }
-        let mut prot = libc::PROT_READ;
-        if map.is_write() {
-            prot |= libc::PROT_WRITE;
-        }
-        if map.is_exec() {
-            prot |= libc::PROT_EXEC;
-        }
-        info!("PROT_HIDE dex mapping {:#x} ({} bytes)", map.start(), map.size());
-        hidden &= prot_hide::remote_mprotect(proc, map.start(), map.size(), prot | PROT_HIDE)?;
+        segments.push(LibSegment {
+            start: map.start(),
+            size: map.size(),
+            prot: map_prot(map),
+        });
+    }
+    if segments.is_empty() {
+        segments.push(LibSegment {
+            start,
+            size: end - start,
+            prot: libc::PROT_READ | libc::PROT_WRITE,
+        });
+    }
+    segments
+}
+
+fn kernel_hide_dex(proc: &RemoteProcess, segments: &[LibSegment]) -> Result<bool> {
+    if segments.is_empty() {
+        bail!("kernel hide: no dex segments");
+    }
+    let mut hidden = true;
+    for seg in segments {
+        info!("kernel hide dex {:#x} ({} bytes)", seg.start, seg.size);
+        hidden &= prot_hide::remote_mprotect(proc, seg.start, seg.size, seg.prot, true)?;
     }
     Ok(hidden)
 }
 
-fn is_anonymous_dex_map(path: Option<String>) -> bool {
-    let Some(path) = path else {
-        return true;
-    };
-    path.is_empty() || path.contains("memfd") || path.contains("dalvik")
+fn map_prot(map: &proc_maps::MapRange) -> i32 {
+    let mut prot = 0;
+    if map.is_read() {
+        prot |= libc::PROT_READ;
+    }
+    if map.is_write() {
+        prot |= libc::PROT_WRITE;
+    }
+    if map.is_exec() {
+        prot |= libc::PROT_EXEC;
+    }
+    prot
 }
 
 fn map_starts(pid: i32) -> HashSet<usize> {

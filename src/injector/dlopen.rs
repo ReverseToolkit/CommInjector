@@ -34,7 +34,7 @@ impl Injector for DlopenInjector {
             maps_search_name: search_name,
             memfd_fd: None,
             jni_onload: None,
-            prot_hide: false,
+            ranges: Vec::new(),
         })
     }
 }

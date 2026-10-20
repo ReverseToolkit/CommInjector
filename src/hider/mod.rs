@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use proc_maps::get_process_maps;
 
 /// 库在目标进程中的一个内存段
+#[derive(Clone)]
 pub struct LibSegment {
     pub start: usize,
     pub size: usize,
@@ -24,13 +25,23 @@ pub struct HideTarget<'a> {
 impl<'a> HideTarget<'a> {
     pub fn new(proc: &'a RemoteProcess, pid: i32, base_addr: usize, maps_search_name: &'a str) -> Result<Self> {
         let segments = collect_lib_segments(pid, maps_search_name)?;
-        Ok(Self {
+        Ok(Self::from_segments(proc, pid, base_addr, maps_search_name, segments))
+    }
+
+    pub fn from_segments(
+        proc: &'a RemoteProcess,
+        pid: i32,
+        base_addr: usize,
+        maps_search_name: &'a str,
+        segments: Vec<LibSegment>,
+    ) -> Self {
+        Self {
             proc,
             pid,
             base_addr,
             maps_search_name,
             segments,
-        })
+        }
     }
 }
 

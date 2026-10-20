@@ -3,7 +3,8 @@ mod dlopen;
 mod linker;
 mod memfd;
 
-use crate::hider::{HideTarget, Hider};
+use crate::hider::{HideTarget, Hider, LibSegment};
+use crate::prot_hide;
 use crate::ptrace_ex::{find_remote_lib_base, remote_close, remote_dlsym};
 use crate::ptrace_ext::RemoteProcess;
 use anyhow::{Result, bail};
@@ -37,7 +38,14 @@ pub struct LoadResult {
     pub memfd_fd: Option<i32>,
     /// 自带 linker 已经从动态符号表里找到的 `JNI_OnLoad`。系统 dlopen 的结果是 `None`。
     pub jni_onload: Option<usize>,
-    pub prot_hide: bool,
+    /// linker 自己创建的映射。dlopen / memfd 留空，段从 maps 里按文件名收集。
+    pub ranges: Vec<MappedRange>,
+}
+
+pub struct MappedRange {
+    pub start: usize,
+    pub size: usize,
+    pub prot: i32,
 }
 
 /// 注入器 trait：不同的加载方式（dlopen / memfd）
@@ -58,6 +66,7 @@ pub fn inject(
     lib_path: &str,
     kind: InjectKind,
     hiders: &[Box<dyn Hider>],
+    kernel_hide: bool,
     jni_key: Option<usize>,
 ) -> Result<InjectedInfo> {
     info!("Injecting {} into pid {}", lib_path, pid);
@@ -70,9 +79,6 @@ pub fn inject(
         InjectKind::Dex { .. } => {
             if !dex::is_dex_payload(lib_path) {
                 bail!("dex subcommand requires a .dex file: {lib_path}");
-            }
-            if !hiders.is_empty() {
-                warn!("hiders apply to injected SOs only and will be skipped for DEX");
             }
         }
         InjectKind::So { .. } | InjectKind::Linker => {
@@ -103,9 +109,9 @@ pub fn inject(
     }
 
     let result = match kind {
-        InjectKind::Dex { ref entry } => dex::inject_dex(&proc, lib_path, entry),
+        InjectKind::Dex { ref entry } => dex::inject_dex(&proc, pid, lib_path, entry, hiders, kernel_hide),
         InjectKind::Linker => {
-            let info = do_linker_inject(&proc, lib_path, hiders);
+            let info = do_linker_inject(&proc, pid, lib_path, hiders, kernel_hide);
             if let Ok(ref injected) = info {
                 if injected.is_valid() {
                     call_jni_onload(&proc, injected, jni_key);
@@ -114,7 +120,7 @@ pub fn inject(
             info
         }
         InjectKind::So { use_memfd } => {
-            let info = do_inject(&proc, pid, lib_path, use_memfd, hiders);
+            let info = do_inject(&proc, pid, lib_path, use_memfd, hiders, kernel_hide);
             if let Ok(ref injected) = info {
                 if injected.is_valid() {
                     call_jni_onload(&proc, injected, jni_key);
@@ -163,6 +169,7 @@ fn do_inject(
     lib_path: &str,
     use_memfd: bool,
     hiders: &[Box<dyn Hider>],
+    kernel_hide: bool,
 ) -> Result<InjectedInfo> {
     let injector: Box<dyn Injector> = if use_memfd {
         info!("Using memfd injection");
@@ -201,6 +208,10 @@ fn do_inject(
                 }
             }
         }
+        if kernel_hide {
+            let fresh = HideTarget::new(proc, pid, load.base_addr, &load.maps_search_name)?;
+            hider_results.push(("kernel".to_string(), kernel_hide_segments(proc, &fresh.segments)));
+        }
     }
 
     if let Some(fd) = load.memfd_fd {
@@ -218,18 +229,88 @@ fn do_inject(
     })
 }
 
-fn do_linker_inject(proc: &RemoteProcess, lib_path: &str, hiders: &[Box<dyn Hider>]) -> Result<InjectedInfo> {
-    if !hiders.is_empty() {
-        warn!("linker load is absent from the system soinfo; maps/solist hiders are skipped");
-    }
+fn do_linker_inject(
+    proc: &RemoteProcess,
+    pid: i32,
+    lib_path: &str,
+    hiders: &[Box<dyn Hider>],
+    kernel_hide: bool,
+) -> Result<InjectedInfo> {
     info!("Using custom linker");
     let load = linker::LinkerInjector.load(proc, lib_path)?;
     info!("custom linker base {:#x}", load.base_addr);
+    let segments: Vec<LibSegment> = load
+        .ranges
+        .iter()
+        .map(|range| LibSegment {
+            start: range.start,
+            size: range.size,
+            prot: range.prot,
+        })
+        .collect();
+    let mut hider_results = apply_user_hiders(proc, pid, load.base_addr, "", &segments, hiders, true);
+    if kernel_hide {
+        hider_results.push(("kernel".to_string(), kernel_hide_segments(proc, &segments)));
+    }
     Ok(InjectedInfo {
         dl_handle: load.handle,
         base_addr: load.base_addr,
-        hider_results: vec![("prot_hide".to_string(), load.prot_hide)],
+        hider_results,
         jni_onload: load.jni_onload,
         custom_link: true,
     })
+}
+
+fn apply_user_hiders(
+    proc: &RemoteProcess,
+    pid: i32,
+    base_addr: usize,
+    maps_search_name: &str,
+    segments: &[LibSegment],
+    hiders: &[Box<dyn Hider>],
+    skip_solist: bool,
+) -> Vec<(String, bool)> {
+    let mut hider_results = Vec::new();
+    let target = HideTarget::from_segments(proc, pid, base_addr, maps_search_name, segments.to_vec());
+    for hider in hiders {
+        let name = hider.name().to_string();
+        if skip_solist && name == "solist" {
+            warn!("solist hider does not apply: this load has no system soinfo");
+            hider_results.push((name, false));
+            continue;
+        }
+        match hider.apply(&target) {
+            Ok(true) => {
+                info!("{name}: succeeded");
+                hider_results.push((name, true));
+            }
+            Ok(false) => {
+                warn!("{name}: failed");
+                hider_results.push((name, false));
+            }
+            Err(e) => {
+                warn!("{name} error: {e:#}");
+                hider_results.push((name, false));
+            }
+        }
+    }
+    hider_results
+}
+
+fn kernel_hide_segments(proc: &RemoteProcess, segments: &[LibSegment]) -> bool {
+    if segments.is_empty() {
+        warn!("kernel hide: no segments");
+        return false;
+    }
+    let mut hidden = true;
+    for seg in segments {
+        match prot_hide::remote_mprotect(proc, seg.start, seg.size, seg.prot, true) {
+            Ok(ok) => hidden &= ok,
+            Err(err) => {
+                warn!("kernel hide {:#x} failed: {err:#}", seg.start);
+                hidden = false;
+            }
+        }
+    }
+    hidden
 }

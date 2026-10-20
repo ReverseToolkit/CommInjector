@@ -25,7 +25,7 @@ impl Injector for MemfdInjector {
             maps_search_name: search,
             memfd_fd: Some(memfd),
             jni_onload: None,
-            prot_hide: false,
+            ranges: Vec::new(),
         })
     }
 }

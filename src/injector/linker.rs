@@ -16,7 +16,7 @@ use crate::elf_image::{
     R_AARCH64_RELATIVE, R_AARCH64_TLS_DTPMOD, R_AARCH64_TLS_DTPREL, R_AARCH64_TLS_TPREL,
     R_AARCH64_TLSDESC, STT_TLS, SharedObject,
 };
-use crate::prot_hide::{self, PROT_HIDE};
+use crate::prot_hide;
 use crate::ptrace_ex::{find_remote_symbol, remote_mmap, remote_munmap as unmap};
 use crate::ptrace_ext::RemoteProcess;
 
@@ -40,17 +40,17 @@ fn load_object(proc: &RemoteProcess, data: &[u8], object: &SharedObject) -> Resu
     let map_start = align_down(object.min_vaddr, page);
     let map_end = align_up(object.min_vaddr + object.span, page);
     let span = (map_end - map_start) as usize;
-    let reserved = prot_hide::remote_mmap_anonymous(proc, span, libc::PROT_NONE)?;
+    let reserved = prot_hide::remote_mmap_anonymous(proc, span, libc::PROT_NONE, false)?;
     let bias = reserved.addr as u64 - map_start;
     info!("custom linker reserved {span:#x} bytes at {:#x}", reserved.addr);
 
-    // 最终是否隐藏取决于每一段 mprotect。mmap 时没带上 PROT_HIDE，后面的 mprotect 仍可以补上。
-    let mut hidden = true;
+    let mut ranges = Vec::new();
     let mut runtime_base = None;
     if let Err(err) = (|| -> Result<()> {
-        copy_segments(proc, data, object, bias, page, &mut hidden)?;
+        ranges = copy_segments(proc, data, object, bias, page)?;
         let mut runtime = install_runtime(proc, object, bias)?;
         runtime_base = Some(runtime.base);
+        ranges.push(runtime.range());
         ensure_needed(proc, &object.needed)?;
         let mut symbols = HashMap::new();
         apply_relocations(proc, object, bias, &mut symbols, &mut runtime)?;
@@ -78,7 +78,7 @@ fn load_object(proc: &RemoteProcess, data: &[u8], object: &SharedObject) -> Resu
         maps_search_name: String::new(),
         memfd_fd: None,
         jni_onload,
-        prot_hide: hidden,
+        ranges,
     })
 }
 
@@ -88,16 +88,16 @@ fn copy_segments(
     object: &SharedObject,
     bias: u64,
     page: u64,
-    hidden: &mut bool,
-) -> Result<()> {
+) -> Result<Vec<super::MappedRange>> {
+    let mut ranges = Vec::new();
     for seg in &object.loads {
         let start = align_down(seg.vaddr, page);
         let end = align_up(seg.vaddr + seg.memsz, page);
         let addr = (bias + start) as usize;
         let size = (end - start) as usize;
-        let prot = seg.prot | PROT_HIDE;
-        let seg_hidden = prot_hide::remote_mprotect(proc, addr, size, prot)?;
-        *hidden &= seg_hidden;
+        let prot = seg.prot;
+        prot_hide::remote_mprotect(proc, addr, size, prot, false)?;
+        ranges.push(super::MappedRange { start: addr, size, prot });
         if seg.filesz == 0 {
             continue;
         }
@@ -110,7 +110,7 @@ fn copy_segments(
         write_chunks(proc, dest, &data[file_off..file_end])?;
         debug!("mapped PT_LOAD {:#x} prot={prot:#x}", dest);
     }
-    Ok(())
+    Ok(ranges)
 }
 
 const RUNTIME_BLOB: &[u8] = include_bytes!("runtime_stub.bin");
@@ -142,10 +142,27 @@ struct Runtime {
     cxa: usize,
     desc_used: usize,
     module_id: u64,
+    range_start: usize,
+    range_size: usize,
+}
+
+impl Runtime {
+    fn range(&self) -> super::MappedRange {
+        super::MappedRange {
+            start: self.range_start,
+            size: self.range_size,
+            prot: libc::PROT_READ | libc::PROT_EXEC,
+        }
+    }
 }
 
 fn install_runtime(proc: &RemoteProcess, object: &SharedObject, bias: u64) -> Result<Runtime> {
-    let mapped = prot_hide::remote_mmap_anonymous(proc, RUNTIME_BLOB.len(), libc::PROT_READ | libc::PROT_WRITE)?;
+    let mapped = prot_hide::remote_mmap_anonymous(
+        proc,
+        RUNTIME_BLOB.len(),
+        libc::PROT_READ | libc::PROT_WRITE,
+        false,
+    )?;
     write_chunks(proc, mapped.addr, RUNTIME_BLOB)?;
     let base = mapped.addr;
     let data = base + OFF_DATA;
@@ -176,13 +193,14 @@ fn install_runtime(proc: &RemoteProcess, object: &SharedObject, bias: u64) -> Re
     }
     let page = page_size() as usize;
     let code_end = OFF_DATA.next_multiple_of(page).min(RUNTIME_BLOB.len().next_multiple_of(page));
-    prot_hide::remote_mprotect(proc, base, code_end.max(page), libc::PROT_READ | libc::PROT_EXEC)?;
+    prot_hide::remote_mprotect(proc, base, code_end.max(page), libc::PROT_READ | libc::PROT_EXEC, false)?;
     if RUNTIME_BLOB.len() > code_end {
         prot_hide::remote_mprotect(
             proc,
             base + code_end,
             RUNTIME_BLOB.len() - code_end,
             libc::PROT_READ | libc::PROT_WRITE,
+            false,
         )?;
     }
     Ok(Runtime {
@@ -193,6 +211,8 @@ fn install_runtime(proc: &RemoteProcess, object: &SharedObject, bias: u64) -> Re
         cxa: base + OFF_CXA,
         desc_used: 0,
         module_id: TLS_MODULE_ID,
+        range_start: base,
+        range_size: code_end.max(page),
     })
 }
 

@@ -20,19 +20,30 @@ pub struct HiddenMap {
     pub hidden: bool,
 }
 
-pub fn remote_mmap_anonymous(proc: &RemoteProcess, size: usize, prot: i32) -> Result<HiddenMap> {
+pub fn remote_mmap_anonymous(
+    proc: &RemoteProcess,
+    size: usize,
+    prot: i32,
+    kernel_hide: bool,
+) -> Result<HiddenMap> {
     if size == 0 {
         bail!("remote mmap size is 0");
     }
     let flags = (libc::MAP_PRIVATE | libc::MAP_ANONYMOUS) as usize;
-    map_with_hide(proc, 0, size, prot, flags, usize::MAX, 0)
+    map_with_hide(proc, 0, size, prot, flags, usize::MAX, 0, kernel_hide)
 }
 
-pub fn remote_mprotect(proc: &RemoteProcess, addr: usize, size: usize, prot: i32) -> Result<bool> {
+pub fn remote_mprotect(
+    proc: &RemoteProcess,
+    addr: usize,
+    size: usize,
+    prot: i32,
+    kernel_hide: bool,
+) -> Result<bool> {
     if size == 0 {
         bail!("remote mprotect size is 0");
     }
-    protect_with_hide(proc, addr, size, prot)
+    protect_with_hide(proc, addr, size, prot, kernel_hide)
 }
 
 fn map_with_hide(
@@ -43,7 +54,12 @@ fn map_with_hide(
     flags: usize,
     fd: usize,
     offset: usize,
+    kernel_hide: bool,
 ) -> Result<HiddenMap> {
+    if !kernel_hide {
+        let mapped = syscall_mmap(proc, addr, size, (prot & !PROT_HIDE) as usize, flags, fd, offset)?;
+        return Ok(HiddenMap { addr: mapped, hidden: false });
+    }
     let want = (prot & !PROT_HIDE) | PROT_HIDE;
     match syscall_mmap(proc, addr, size, want as usize, flags, fd, offset) {
         Ok(mapped) => Ok(HiddenMap { addr: mapped, hidden: true }),
@@ -56,7 +72,17 @@ fn map_with_hide(
     }
 }
 
-fn protect_with_hide(proc: &RemoteProcess, addr: usize, size: usize, prot: i32) -> Result<bool> {
+fn protect_with_hide(
+    proc: &RemoteProcess,
+    addr: usize,
+    size: usize,
+    prot: i32,
+    kernel_hide: bool,
+) -> Result<bool> {
+    if !kernel_hide {
+        syscall_mprotect(proc, addr, size, (prot & !PROT_HIDE) as usize)?;
+        return Ok(false);
+    }
     let want = (prot & !PROT_HIDE) | PROT_HIDE;
     match syscall_mprotect(proc, addr, size, want as usize) {
         Ok(()) => Ok(true),

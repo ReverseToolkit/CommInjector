@@ -40,9 +40,13 @@ struct Cli {
     #[arg(short, long, default_value_t = 5)]
     timeout: u64,
 
-    /// 启用的隐藏器，可多次指定
+    /// 用户态隐藏，可多次指定。maps 重映射成匿名段，solist 卸掉 soinfo
     #[arg(long = "hider", value_enum)]
     hiders: Vec<HiderKind>,
+
+    /// 关闭内核 PROT_HIDE。默认开启，和 --hider 独立
+    #[arg(long)]
+    no_kernel_hide: bool,
 
     /// JNI_OnLoad 验证 key，payload 端可通过 reserved 参数校验
     /// 支持十六进制（0x1337）或十进制
@@ -59,7 +63,7 @@ enum InjectMethod {
     Dlopen,
     /// 使用 memfd_create + android_dlopen_ext 注入 SO，绕过路径限制
     Memfd,
-    /// 用自带 linker 装载 SO。映射带 PROT_HIDE，不进入系统 soinfo
+    /// 用自带 linker 装载 SO，不进入系统 soinfo
     Linker,
     /// 将 DEX 合并进目标进程自己的 ClassLoader（不加载 SO）
     Dex {
@@ -128,7 +132,14 @@ fn main() -> Result<()> {
         match wait_for_proc_ready(event.pid, Duration::from_secs(cli.timeout)) {
             Ok(true) => {
                 info!("pid {} ready, injecting...", event.pid);
-                match injector::inject(event.pid, &cli.lib, kind.clone(), &hiders, jni_key) {
+                match injector::inject(
+                    event.pid,
+                    &cli.lib,
+                    kind.clone(),
+                    &hiders,
+                    !cli.no_kernel_hide,
+                    jni_key,
+                ) {
                     Ok(info) => {
                         let hider_summary: String = info
                             .hider_results
